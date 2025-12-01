@@ -3,159 +3,186 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>evecia - Technical Documentation</title>
+    <title>evecia - Comprehensive Documentation</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; margin: 0; padding: 20px; background-color: #f7f7fb; color: #111; }
-        .container { max-width: 900px; margin: 0 auto; background: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
-        h1, h2, h3 { color: #333; border-bottom: 2px solid #eee; padding-bottom: 5px; }
+        .container { max-width: 1000px; margin: 0 auto; background: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
+        h1, h2, h3, h4 { color: #333; border-bottom: 2px solid #eee; padding-bottom: 5px; }
         h1 { border-bottom: 3px solid #ccc; }
         code { background-color: #f0f0f0; padding: 2px 4px; border-radius: 4px; font-family: "Courier New", monospace; font-size: 0.9em; }
         pre { background-color: #eef3ff; padding: 10px; border-radius: 4px; overflow-x: auto; font-size: 0.85em; }
         ul { margin: 10px 0; padding-left: 25px; }
         li { margin-bottom: 8px; }
-        .note { border-left: 4px solid #f90; background-color: #fffbe6; padding: 10px 15px; margin: 15px 0; border-radius: 4px; }
+        .note { border-left: 4px solid #007bff; background-color: #eef3ff; padding: 10px 15px; margin: 15px 0; border-radius: 4px; }
+        .warning { border-left: 4px solid #f90; background-color: #fffbe6; padding: 10px 15px; margin: 15px 0; border-radius: 4px; }
         .endpoint { margin-bottom: 20px; border: 1px solid #ddd; padding: 10px; border-radius: 4px; background-color: #fafafa; }
         .endpoint h4 { margin-top: 0; color: #555; }
         .function-desc { font-style: italic; color: #666; }
+        .visual-cue { font-weight: bold; color: #c00; }
+        .cooperation-cue { font-weight: bold; color: #090; }
+        .video-container { margin: 20px 0; padding: 15px; background: #f0f0f0; border-radius: 8px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>evecia - Technical Documentation</h1>
+        <h1>evecia: Comprehensive EVE Online Pilot Analysis Tool</h1>
 
         <div class="note">
-            This document describes the functionality of the **evecia** program, designed to analyze pilot statistics from the game EVE Online, utilizing the ESI (EVE Swagger Interface) API and zKillboard data.
+            This document serves as both a user guide and technical documentation for the **evecia** program. evecia is designed for the rapid analysis of pilot combat statistics and affiliations within EVE Online, utilizing the ESI (EVE Swagger Interface) API and zKillboard data.
         </div>
 
-        <h2 id="architecture">1. Structure and Architecture</h2>
-        <p>The application employs a **single-file** architecture in PHP (<code>index.php</code>) with a frontend based on pure HTML/CSS/JavaScript (the JS code in the separate <code>app.js</code> file is dynamically loaded). The PHP backend serves as a gateway (proxy) to external APIs (ESI, zKillboard) and manages a local SQLite database for data caching.</p>
+        <hr>
 
-        <h3>1.1 Files</h3>
+        <h2 id="how-it-works">1. Operational Flow and Metrics</h2>
+
+        <h3>1.1 Data Input and Retrieval</h3>
+        <ul>
+            <li>**Pasting Data:** The user pastes a list of pilot names (e.g., from the in-game Local chat).</li>
+            <li>**Automatic Analysis:** The system automatically recognizes the names and links them to unique EVE pilot IDs (via ESI).</li>
+            <li>**Data Collection:** For each ID, the program fetches:
+                <ol>
+                    <li>Current affiliations (corporation, alliance).</li>
+                    <li>Combat statistics from zKillboard (Kills, Losses, Solo%, Danger Ratio).</li>
+                </ol>
+            </li>
+            <li>**Time Zone (TZ) Analysis:** The program analyzes the raw zKillboard statistics to estimate the pilot's most active time zone (EU, US, AU).</li>
+        </ul>
+
+        <h3>1.2 Combat Statistics Gathering</h3>
+        <p>Key metrics gathered for each pilot:</p>
+        <ul>
+            <li>**Kills** and **Losses**: Total number of ships destroyed and lost.</li>
+            <li>**Solo%**: Solo Kill ratio, indicating how often the pilot fought alone.</li>
+            <li>**Danger Ratio**: A metric quantifying the danger level of the pilot's typical engagement.</li>
+        </ul>
+
+        <hr>
+
+        <h2 id="visualization">2. Results and Visualization</h2>
+
+        <h3>2.1 Pilot Statistics Table</h3>
+        <ul>
+            <li>**Affiliations:** Displays the current corporation and alliance with logos.</li>
+            <li>**Sorting:** The table allows quick sorting by any column (e.g., by Solo%, Kills, Alliance).</li>
+            <li>**"Top All Time" Panel:** When hovering over a pilot's row, a historical summary appears in the side panel: <span class="visual-cue">most kills in these ships</span>, <span class="visual-cue">most active systems</span>, and <span class="visual-cue">the number of their own kills for a given alliance</span>. These three categories should be treated separately, but **connected if it narrows down what ship the pilot might be in, what system, and at what time** (time information is derived from the TZ column).</li>
+        </ul>
+
+        <h3>2.2 Interaction Matrix (Heat Map)</h3>
+        <p>The matrix analyzes internal relationships within the listed group:</p>
+        <ul>
+            <li>**Cooperation (<span class="cooperation-cue">Green</span>):** Indicates shared affiliations (corporation/alliance) currently or within the last year.</li>
+            <li>**Shared Actions (<span class="visual-cue">Red</span>):** Indicates that two pilots were involved as attackers or victims in the **same 50 most recent killmails/lossmails**, regardless of affiliation.</li>
+        </ul>
+
+        <hr>
+
+        <h2 id="video-guide">3. 🎥 Video Guide: Inputting Multiple Characters</h2>
+        
+        <p>The most important and critical step in analysis is correctly gathering and inputting multiple pilot names. This short video guide demonstrates the process of copying data from the in-game Local channel and pasting it into the application.</p>
+
+        <div class="video-container">
+            <h3>Title: evecia help</h3>
+            <p><strong>Source:</strong> <a href="http://www.youtube.com/watch?v=rUH-diaVi2s" target="_blank">coodwatyy coodwatyy</a></p>
+            <p><strong>Instructions Summary (00:28):</strong></p>
+            <ol>
+                <li>Select one character from the Local chat channel in EVE Online.</li>
+                <li>Press <kbd>A</kbd> to select all characters on the list.</li>
+                <li>Press <kbd>Ctrl</kbd> + <kbd>C</kbd> to copy them to the clipboard.</li>
+                <li>Select the main evecia page and press <kbd>Ctrl</kbd> + <kbd>V</kbd>.</li>
+            </ol>
+        </div>
+
+        <hr>
+
+        <h2 id="technical">4. Technical Details: Architecture and Components</h2>
+
+        <div class="note">
+            This section provides the technical documentation derived from <code>index.php</code> and <code>index(5).html</code>, detailing the application's structure and core functions.
+        </div>
+
+        <h3>4.1. File Structure and Database</h3>
+        <p>The application uses a minimalist PHP single-file architecture (<code>index.php</code>) serving as an API gateway, with the frontend managed by JavaScript (<code>app.js</code>).</p>
+        
+        <h4>Files</h4>
         <ul>
             <li><code>index.php</code>: Contains the backend logic (PHP), API definitions, DB caching logic, and generates the frontend HTML.</li>
             <li><code>app.js</code>: Contains all frontend logic (JavaScript), DOM handling, API requests to <code>index.php</code>, and rendering of tables and the interaction matrix.</li>
-            <li><code>data.sqlite</code>: WARNING!!! The local SQLite database file used for caching pilot data, statistics, top lists, and logos (this file will be deleted and rewriten periodicaly to keep data accurate. It speeds up program but makes data inaccurate).</li>
+            <li><code>data.sqlite</code>: Local SQLite database used for caching pilot data, statistics, top lists, and logos.</li>
         </ul>
+        <div class="warning">
+            **DATA CACHE WARNING (<code>data.sqlite</code>):** This file is **deleted and rewritten periodically to keep data accurate.** While it speeds up program performance, data older than the cache cycle is deliberately volatile.
+        </div>
+
+        <h3>4.2. PHP Backend (<code>index.php</code>) and API Endpoints</h3>
         
-        <hr>
-
-        <h2 id="backend-php">2. PHP Backend (<code>index.php</code>)</h2>
-
-        <h3>2.1 Configuration</h3>
+        <h4>Configuration and Database</h4>
         <ul>
-            <li><code>define('UA', 'evecia/5.0 (+mailto:pawel.kalaska@gmail.com)');</code>: Defines the User Agent, which is crucial for compliance with EVE API (ESI) access rules.</li>
-            <li><code>define('DB', __DIR__.'/data.sqlite');</code>: The file path to the SQLite database.</li>
+            <li><code>define('UA', 'evecia/5.0 (+mailto:pawel.kalaska@gmail.com)');</code>: Defines the User Agent, crucial for compliance with ESI API rules.</li>
+            <li><code>define('DB', __DIR__.'/data.sqlite');</code>: Path to the SQLite database file.</li>
+            <li><code>function db()</code>: Initializes the SQLite connection and ensures the creation of tables (<code>characters</code>, <code>stats</code>, <code>top</code>, <code>logos</code>). Uses `WAL` (Write-Ahead Logging).</li>
+            <li><code>function db_fetch_logo($type, $id, $size=64)</code>: Fetches corporation/alliance logos from ESI and caches them in the <code>logos</code> table for 30 days.</li>
         </ul>
 
-        <h3>2.2 Database Functions</h3>
-        <ul>
-            <li><code>function db()</code>:
-                <div class="function-desc">Initializes the SQLite database connection. Creates the <code>characters</code>, <code>stats</code>, <code>top</code>, and <code>logos</code> tables if they do not exist. It uses `WAL` (Write-Ahead Logging) mode for better performance.</div>
-            </li>
-            <li><code>function db_fetch_logo($type, $id, $size=64)</code>:
-                <div class="function-desc">Fetches corporation/alliance logos from ESI and caches them as a BLOB in the <code>logos</code> table for 30 days. It prioritizes the cache and returns the old image from the cache if fetching from ESI fails.</div>
-            </li>
-        </ul>
-
-        <h3>2.3 API Endpoints (Action-Based)</h3>
-        <p>The backend exposes several actions (<code>$_GET['action']</code>) that are called by the frontend JS.</p>
+        <h4>API Endpoints (Actions called by JS)</h4>
 
         <div class="endpoint">
-            <h4>`action=logo` (GET)</h4>
+            <h4><code>action=logo</code> (GET)</h4>
             <div class="function-desc"><strong>Purpose:</strong> Serves cached corporation or alliance logos.</div>
-            <ul>
-                <li><strong>Parameters:</strong> <code>id</code> (entity ID), <code>type</code> (`corp` or `alli`), <code>size</code> (size in px, default 64).</li>
-                <li><strong>Response:</strong> `Content-Type: image/png` header and binary image data (or 404). Sets browser cache for 1 hour.</li>
-            </ul>
         </div>
         
         <div class="endpoint">
-            <h4>`action=resolveBatch` (POST/JSON)</h4>
-            <div class="function-desc"><strong>Purpose:</strong> Batch resolution of pilot names (from the frontend) to EVE pilot IDs, using ESI.</div>
-            <ul>
-                <li><strong>Payload:</strong> <code>{names: ["Pilot Name 1", ...]}</code>.</li>
-                <li><strong>Logic:</strong> First attempts ESI <code>/universe/ids/</code>, then ESI <code>/search/</code> with <code>strict=true</code> and <code>strict=false</code>.</li>
-            </ul>
+            <h4><code>action=resolveBatch</code> (POST/JSON)</h4>
+            <div class="function-desc"><strong>Purpose:</strong> Batch resolution of pilot names to EVE IDs (using ESI).</div>
         </div>
 
         <div class="endpoint">
-            <h4>`action=pilot` (POST/JSON)</h4>
-            <div class="function-desc"><strong>Purpose:</strong> Retrieves detailed pilot data (including corporation/alliance) from ESI and caches it in the <code>characters</code> table.</div>
-            <ul>
-                <li><strong>Payload:</strong> <code>{id: 12345}</code>.</li>
-                <li><strong>Logic:</strong> Uses ESI <code>/characters/{id}/</code>, <code>/corporations/{id}/</code>, <code>/alliances/{id}/</code>. Updates the database.</li>
-            </ul>
-        </div>
-
-        <div class="endpoint">
-            <h4>`action=stats` (POST/JSON)</h4>
-            <div class="function-desc"><strong>Purpose:</strong> Retrieves detailed pilot statistics from the zKillboard API and caches key metrics (kills, losses, solo, danger) in the <code>stats</code> table.</div>
-            <ul>
-                <li><strong>Payload:</strong> <code>{id: 12345}</code>.</li>
-                <li><strong>Logic:</strong> Uses zKB API <code>/api/stats/characterID/{id}/</code>. Returns the entire JSON object from zKB, including data for charts (<code>labels</code>).</li>
-            </ul>
+            <h4><code>action=stats</code> (POST/JSON)</h4>
+            <div class="function-desc"><strong>Purpose:</strong> Retrieves detailed pilot statistics from the zKillboard API and caches key metrics.</div>
         </div>
         
         <div class="endpoint">
-            <h4>`action=top` (POST/JSON)</h4>
+            <h4><code>action=top</code> (POST/JSON)</h4>
             <div class="function-desc"><strong>Purpose:</strong> Retrieves "Top All Time Kills In" lists (ships, systems, alliances) from zKillboard, prioritizing cache.</div>
-            <ul>
-                <li><strong>Logic:</strong> 1) Local cache. 2) Scrapping zKB HTML <code>/topalltime/</code> (with fallbacks to zKB API and recent 100 killmails if the first attempts fail). Caches the result in <code>top</code>.</li>
-            </ul>
+        </div>
+
+        <div class="endpoint">
+            <h4><code>action=graph</code> (POST/JSON)</h4>
+            <div class="function-desc"><strong>Purpose:</strong> Generates the interaction matrix (coop/shots) based on the last 100 killmails for each pilot, calculating interaction weights.</div>
         </div>
         
         <div class="endpoint">
-            <h4>`action=graph` (POST/JSON)</h4>
-            <div class="function-desc"><strong>Purpose:</strong> Generates the interaction matrix (coop/shots) based on the last 100 killmails for each pilot.</div>
-            <ul>
-                <li><strong>Logic:</strong> Uses zKB API <code>/api/kills/characterID/{id}/page/1/</code> to retrieve the last 100 killmails. Calculates weights based on recency, final blow, and solo kills to determine interaction strength.</li>
-            </ul>
+            <h4><code>action=zkbByUrl</code> and <code>action=zkbSalt</code></h4>
+            <div class="function-desc"><strong>Purpose:</strong> Proxy functions for zKillboard killlist retrieval (managing the required `s=` salt parameter).</div>
         </div>
+
+        <h3>4.3. Frontend JavaScript (<code>app.js</code>) and Key Logic</h3>
+        <p>The JavaScript code manages application state and the entire user interface logic.</p>
+
+        <h4>State Management and Key Logic Functions</h4>
+        <ul>
+            <li><code>state</code>: Global state object storing the list of pilots, sorting key, and sorting direction.</li>
+            <li><code>onAnalyze() / window.__run</code>: The main analysis cycle, sequentially calling `resolveBatch`, `pilot`, `stats`, `graph`, and Top All Time data fetching.</li>
+            <li><code>renderLeft()</code>: Renders the main pilot table (<code>#tab</code>), implementing complex multi-level sorting logic.</li>
+            <li><code>renderTop(id)</code>: Displays detailed Top All Time data.</li>
+            <li><code>renderHeat()</code>: Renders the interaction matrix table (<code>#heat</code>).</li>
+            <li><code>analyzeTimezone(statsData)</code>: Extracts the pilot's timezone (TZ) from zKB data.</li>
+        </ul>
+
+        <h3>4.4. Data Management and Keyboard Shortcuts</h3>
         
-        <div class="endpoint">
-            <h4>`action=zkbByUrl` and `action=zkbSalt`</h4>
-            <div class="function-desc"><strong>Purpose:</strong> Proxy functions for zKillboard to retrieve killlists (managing the `s=` salt parameter). Used for fetching recent kills and losses.</div>
-        </div>
-
-        <hr>
-
-        <h2 id="frontend-js">3. JavaScript Frontend (<code>app.js</code>)</h2>
-        <p>The JavaScript code (IIFE) manages the application state (<code>state</code>) and all user interface logic.</p>
-
-        <h3>3.1 State Management and I/O</h3>
+        <h4>Save and Load</h4>
         <ul>
-            <li><code>state</code>: A global state object storing the list of pilots (<code>rows</code>), the sorting key (<code>sortKey</code>, default `alliance`), the sorting direction (<code>sortDir</code>), and the status of the Top Panel.</li>
-            <li><code>saveState() / loadState(json)</code>: Functions to serialize and deserialize the application state (pilots, names) to JSON format. Used for handling the **Save As** (`Ctrl+S`) and **Quick Save** (`Ctrl+Q`, uses `localStorage`) buttons.</li>
-            <li>**Quick Load:** The **Open** button (`Ctrl+O`) defaults to loading the state from `localStorage` (Quick Save), unless clicked with a modifier (`Ctrl/Shift`), which forces the file dialog to open.</li>
+            <li><code>saveState() / loadState(json)</code>: Functions to serialize and deserialize the application state to JSON format.</li>
+            <li>**Save As** (<kbd>Ctrl+S</kbd>): Saves the list of pilots to a JSON file.</li>
+            <li>**Quick Save** (<kbd>Ctrl+Q</kbd>): Saves the state to the browser's local storage (`localStorage`).</li>
         </ul>
 
-        <h3>3.2 Key Logic Functions</h3>
-        <ul>
-            <li><code>onAnalyze() / window.__run</code>:
-                <div class="function-desc">The main analysis cycle: 1. Parse text from the textarea. 2. Call <code>action=resolveBatch</code> (pilot IDs). 3. Iteratively call <code>action=pilot</code> and <code>action=stats</code> (retrieve details and statistics). 4. Call <code>action=graph</code> (generate matrix). 5. Fetch Top All Time data for the first pilot.</div>
-            </li>
-            <li><code>renderLeft()</code>:
-                <div class="function-desc">Renders the main pilot table (<code>#tab</code>). Implements complex sorting logic. For non-numeric columns (e.g., K/D, Solo%), it uses secondary sorting by alliance/corporation/name.</div>
-            </li>
-            <li><code>renderTop(id)</code>:
-                <div class="function-desc">Displays detailed Top All Time (ships, systems, alliances) for the pilot whose row the cursor hovers over (calls <code>action=top</code> and caches the result in <code>topCache</code>).</div>
-            </li>
-            <li><code>renderHeat()</code>:
-                <div class="function-desc">Renders the interaction matrix table (<code>#heat</code>). Cells are highlighted: green for shared affiliations (corp/alli), red for shared killmails/losses from the last 50.</div>
-            </li>
-            <li><code>analyzeTimezone(statsData)</code>:
-                <div class="function-desc">Extracts the pilot's timezone (TZ) from zKB data (<code>labels</code> → <code>tz:...</code>) and returns an abbreviated string like `EU/US`.</div>
-            </li>
-        </ul>
-
-        <h3>3.3 Keyboard Shortcuts</h3>
+        <h4>Keyboard Shortcuts</h4>
         <p>Global keyboard shortcuts are handled by <code>document.addEventListener('keydown')</code> and <code>document.addEventListener('paste')</code>:</p>
         <ul>
-            <li><kbd>Ctrl/Cmd</kbd> + <kbd>S</kbd>: Save As (Save as JSON file).</li>
-            <li><kbd>Ctrl/Cmd</kbd> + <kbd>Q</kbd>: Quick Save (Quick save to `localStorage`).</li>
-            <li><kbd>Ctrl/Cmd</kbd> + <kbd>O</kbd>: Open (Open file dialog).</li>
-            <li><kbd>Ctrl/Cmd</kbd> + <kbd>Enter</kbd>: Analyze (Run analysis).</li>
-            <li><kbd>Ctrl/Cmd</kbd> + <kbd>V</kbd> (global paste): Pastes text into the memo field and automatically starts the analysis.</li>
+            <li><kbd>Ctrl/Cmd</kbd> + <kbd>V</kbd>: Pastes text into the memo field and automatically starts analysis.</li>
+            <li><kbd>Ctrl/Cmd</kbd> + <kbd>Enter</kbd>: Run analysis.</li>
+            <li><kbd>Ctrl/Cmd</kbd> + <kbd>O</kbd>: Open (Opens file dialog or Quick Load from `localStorage`).</li>
         </ul>
     </div>
 </body>
