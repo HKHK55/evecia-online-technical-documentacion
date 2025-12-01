@@ -1,17 +1,10 @@
 <?php
-// UA (User Agent) constant definition. This is MANDATORY for EVE Online ESI API compliance and responsible data usage.
+// Stała definicja UA (User Agent) jest potrzebna w sekcji PHP
 define('UA', 'evecia/5.0 (+mailto:pawel.kalaska@gmail.com)'); 
-// Path to the local SQLite database file, used for persistent caching of pilot data and assets.
-define('DB', __DIR__.'/data.sqlite'); 
+define('DB', __DIR__.'/data.sqlite'); // Ścieżka do bazy danych
 
-// Database connection handler. Initializes connection and schema if needed.
-function db(){ static $d; 
-  if($d) return $d; 
-  
-  $d=new PDO('sqlite:'.DB); 
-  $d->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
-  // Initialize database schema
+// Funkcja dostępu do DB
+function db(){ static $d; if($d) return $d; $d=new PDO('sqlite:'.DB); $d->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
   $d->exec("PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS characters(
   id INTEGER PRIMARY KEY, name TEXT, birthday TEXT,
@@ -33,419 +26,729 @@ CREATE TABLE IF NOT EXISTS logos(
     img_data BLOB,
     updated_at TEXT
 );");
-  
-  // Attempt to add a new column for cheap database schema migration without dropping tables.
-  try{ $d->exec("ALTER TABLE top ADD COLUMN alliances_json TEXT"); } catch(PDOException $e){}
+  // Try to add column if missing (cheap migration)
+  try{ $d->exec("ALTER TABLE top ADD COLUMN alliances_json TEXT"); } catch(Exception $e){}
   return $d;
 }
 
-// Universal HTTP request wrapper using cURL. Handles timeouts, custom headers, and POST data transmission.
-function http($url, $opts=[]){
-  $ch=curl_init($url);
-  curl_setopt($ch, CURLOPT_USERAGENT, UA);
-  curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-  curl_setopt($ch, CURLOPT_TIMEOUT, $opts['timeout']??10);
-  if(!empty($opts['headers'])) curl_setopt($ch, CURLOPT_HTTPHEADER, $opts['headers']);
-  if(!empty($opts['post'])) curl_setopt($ch, CURLOPT_POSTFIELDS, $opts['post']);
-  if(!empty($opts['post'])) curl_setopt($ch, CURLOPT_POST, 1);
+// Funkcja pobierająca obrazek z ESI i zapisująca do bazy danych
+function db_fetch_logo($type, $id, $size=64) {
+    $db = db();
+    $key = $id * 1000 + $size; // Tworzymy unikalny klucz dla ID i rozmiaru
+    $keyType = $type;
 
-  $data=curl_exec($ch);
-  $http_code=curl_getinfo($ch, CURLINFO_HTTP_CODE);
-  $err=curl_error($ch);
-  curl_close($ch);
+    // 1. Sprawdź cache
+    $st = $db->prepare("SELECT img_data, updated_at FROM logos WHERE id = :id AND type = :type");
+    $st->execute([':id' => $key, ':type' => $keyType]);
+    $row = $st->fetch(PDO::FETCH_ASSOC);
 
-  if($err) throw new Exception('cURL Error: '.$err);
-  if($http_code>=400) throw new Exception('HTTP Error '.$http_code.' for '.$url);
-  return $data;
-}
-
-// Wrapper function specifically for the EVE Swagger Interface (ESI) API. Handles JSON decoding.
-function esi($path, $opts=[]){
-  $url='https://esi.evetech.net/latest'.$path;
-  $data=http($url, $opts);
-  return json_decode($data, true);
-}
-
-// ------------------------------------------------------------------
-// API ACTIONS HANDLER
-// ------------------------------------------------------------------
-
-$action=$_GET['action']??'';
-try {
-  if($action){
-    // Set standard headers for JSON API responses from the backend.
-    header('Content-Type: application/json');
-    $post_data=json_decode(file_get_contents('php://input'), true);
-
-    switch($action){
-      case 'resolveBatch':
-        // Endpoint for batch resolution of pilot names to character IDs using ESI.
-        $names=$post_data['names']??[];
-        if(!$names) throw new Exception('Missing input data (names)');
-        $resolved=[];
-        
-        // Step 1: Attempt batch resolution using the most efficient ESI endpoint (/universe/ids/).
-        $ids_data=esi('/universe/ids/', ['post'=>json_encode($names), 'headers'=>['Content-Type: application/json']]);
-        $char_map=[];
-        if(!empty($ids_data['characters'])) foreach($ids_data['characters'] as $c) $char_map[strtolower($c['name'])]=$c['id'];
-        
-        // Step 2: For remaining unresolved names, try strict ESI search.
-        $remaining=[];
-        foreach($names as $n) if(!isset($char_map[strtolower($n)])) $remaining[]=$n;
-
-        if($remaining){
-            $search_data=esi('/search/', ['path'=>'?categories=character&search='.urlencode(implode(',', $remaining)).'&strict=true']);
-            if(!empty($search_data['character'])) {
-                // ESI search returns IDs, so we call ESI names endpoint to match IDs back to original names.
-                $info_data=esi('/characters/names/', ['post'=>json_encode($search_data['character']), 'headers'=>['Content-Type: application/json']]);
-                if($info_data) foreach($info_data as $c) $char_map[strtolower($c['name'])]=$c['character_id'];
-            }
-        }
-
-        // Step 3: For still unresolved names, try non-strict (fuzzy) ESI search as a last resort.
-        $remaining=[];
-        foreach($names as $n) if(!isset($char_map[strtolower($n)])) $remaining[]=$n;
-
-        if($remaining){
-            $search_data=esi('/search/', ['path'=>'?categories=character&search='.urlencode(implode(',', $remaining)).'&strict=false']);
-            if(!empty($search_data['character'])) {
-                // ESI search returns IDs, call ESI names endpoint to match IDs back to names.
-                $info_data=esi('/characters/names/', ['post'=>json_encode($search_data['character']), 'headers'=>['Content-Type: application/json']]);
-                if($info_data) foreach($info_data as $c) $char_map[strtolower($c['name'])]=$c['character_id'];
-            }
-        }
-        
-        // Final assembly of the resolved list, including null IDs for names that could not be found.
-        foreach($names as $n){
-            $resolved[]= [
-                'name'=>$n,
-                'id'=>$char_map[strtolower($n)]??null
-            ];
-        }
-
-        echo json_encode($resolved);
-        break;
-
-      case 'pilot':
-        // Endpoint for fetching and caching core character details (corporation, alliance, birthday) from ESI.
-        $id=$post_data['id']??0;
-        if(!$id) throw new Exception('Invalid character ID');
-        
-        $db=db();
-        // Check cache for pilot details. Data is considered valid if updated within the last 30 days.
-        $stmt=$db->prepare("SELECT * FROM characters WHERE id=? AND updated_at > datetime('now', '-30 day')");
-        $stmt->execute([$id]);
-        $data=$stmt->fetch(PDO::FETCH_ASSOC);
-
-        if(!$data){
-            // Fetch fresh data from ESI
-            $char_info=esi('/characters/'.$id.'/');
-            if(empty($char_info['name'])) throw new Exception('Character not found: '.$id);
-            
-            $corp_info=esi('/corporations/'.$char_info['corporation_id'].'/');
-            $alliance_info=null;
-            if(!empty($char_info['alliance_id'])) $alliance_info=esi('/alliances/'.$char_info['alliance_id'].'/');
-
-            $data=[
-                'id'=>$id,
-                'name'=>$char_info['name'],
-                'birthday'=>$char_info['birthday'],
-                'corp_id'=>$char_info['corporation_id'],
-                'corp_name'=>$corp_info['name'],
-                'alliance_id'=>$char_info['alliance_id']??null,
-                'alliance_name'=>$alliance_info['name']??null,
-            ];
-
-            // Save/Update the character and related corporation/alliance info in the cache.
-            $stmt=$db->prepare("REPLACE INTO characters (id, name, birthday, corp_id, corp_name, alliance_id, alliance_name, updated_at) 
-                                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))");
-            $stmt->execute([
-                $data['id'], $data['name'], $data['birthday'], 
-                $data['corp_id'], $data['corp_name'], 
-                $data['alliance_id'], $data['alliance_name'], 
-            ]);
-        }
-
-        echo json_encode($data);
-        break;
-      
-      case 'stats':
-        // Endpoint for fetching and caching character combat statistics from zKillboard.
-        $id=$post_data['id']??0;
-        if(!$id) throw new Exception('Invalid character ID for stats');
-        
-        $db=db();
-        // Combat stats are volatile and cached for only 7 days.
-        $stmt=$db->prepare("SELECT * FROM stats WHERE char_id=? AND updated_at > datetime('now', '-7 day')");
-        $stmt->execute([$id]);
-        $data=$stmt->fetch(PDO::FETCH_ASSOC);
-
-        if(!$data){
-            // Fetch fresh stats from zKillboard API
-            $zkb_url='https://zkillboard.com/api/stats/characterID/'.$id.'/';
-            $zkb_data=http($zkb_url);
-            $stats=json_decode($zkb_data, true);
-
-            if(!$stats || isset($stats['error'])) throw new Exception('zKillboard Error: '.($stats['error']??'Unknown'));
-
-            $db_data=[
-                'char_id'=>$id,
-                'kills'=>$stats['kills']??0,
-                'losses'=>$stats['losses']??0,
-                'solo'=>$stats['soloKills']??0,
-                'group_kills'=>$stats['groupKills']??0,
-                'danger'=>$stats['dangerRatio']??0,
-            ];
-
-            // Persist key metrics to the stats cache
-            $stmt=$db->prepare("REPLACE INTO stats (char_id, kills, losses, solo, group_kills, danger, updated_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))");
-            $stmt->execute(array_values($db_data));
-            
-            // Attach raw statistics data from zKillboard to the response for front-end analysis (charts, timezone detection).
-            $db_data['raw_zkb_stats']=$stats;
-            $data=$db_data;
-        } else {
-            // If cached, still fetch raw ZKB data for charts/TZ detection in the frontend, as this API call is quick and ensures freshness for dynamic elements.
-            $zkb_url='https://zkillboard.com/api/stats/characterID/'.$id.'/';
-            $zkb_data=http($zkb_url);
-            $stats=json_decode($zkb_data, true);
-            $data['raw_zkb_stats']=$stats;
-        }
-
-        echo json_encode($data);
-        break;
-
-      case 'top':
-        // Endpoint for fetching and caching Top All Time lists (Ships, Systems, Alliances).
-        $id=$post_data['id']??0;
-        if(!$id) throw new Exception('Invalid character ID for TOP lists');
-        
-        $db=db();
-        // Check the 'top' table cache. Top lists are relatively static and cached for 30 days.
-        $stmt=$db->prepare("SELECT ships_json, systems_json, alliances_json FROM top WHERE char_id=? AND updated_at > datetime('now', '-30 day')");
-        $stmt->execute([$id]);
-        $data=$stmt->fetch(PDO::FETCH_ASSOC);
-
-        if(!$data || empty($data['ships_json']) || empty($data['systems_json']) || empty($data['alliances_json'])){
-            // Fetch fresh Top All Time data from zKillboard API
-            $ships_url='https://zkillboard.com/api/topalltime/characterID/'.$id.'/limit/10/type/ship/';
-            $systems_url='https://zkillboard.com/api/topalltime/characterID/'.$id.'/limit/10/type/system/';
-            $alliances_url='https://zkillboard.com/api/topalltime/characterID/'.$id.'/limit/10/type/alliance/';
-            
-            $ships_data=json_decode(http($ships_url), true);
-            $systems_data=json_decode(http($systems_url), true);
-            $alliances_data=json_decode(http($alliances_url), true);
-
-            $data=[
-                'ships_json'=>json_encode($ships_data),
-                'systems_json'=>json_encode($systems_data),
-                'alliances_json'=>json_encode($alliances_data),
-            ];
-
-            // Persist data to the top cache
-            $stmt=$db->prepare("REPLACE INTO top (char_id, ships_json, systems_json, alliances_json, updated_at) 
-                                VALUES (?, ?, ?, ?, datetime('now'))");
-            $stmt->execute([$id, $data['ships_json'], $data['systems_json'], $data['alliances_json']]);
-        }
-
-        // Decode JSON objects for the final response payload
-        echo json_encode([
-            'ships'=>json_decode($data['ships_json'], true),
-            'systems'=>json_decode($data['systems_json'], true),
-            'alliances'=>json_decode($data['alliances_json'], true),
-        ]);
-        break;
-
-      case 'zkbByUrl':
-        // Proxy endpoint for direct zKillboard API access where custom headers are needed.
-        $url=$_GET['url']??'';
-        if(!$url) throw new Exception('Missing URL parameter');
-
-        // Required headers to ensure proper access to specific zKillboard API endpoints (e.g., killmail detail or lists).
-        $opts=['headers'=>[
-            'Referer: https://zkillboard.com/', 
-            'X-Requested-With: XMLHttpRequest'
-        ]];
-        
-        $data=http($url, $opts);
-        echo $data;
-        break;
-
-      case 'zkbSalt':
-        // Proxy endpoint used to retrieve zKillboard's dynamic 'salt' parameter for specific API requests.
-        $url=$_GET['url']??'';
-        if(!$url) throw new Exception('Missing URL parameter');
-
-        // Retrieve the dynamic 'salt' parameter from zKillboard's JavaScript file.
-        $salt=http('https://zkillboard.com/js/salt.js');
-        $salt=str_replace(['document.write("', '");'], '', trim($salt));
-
-        $data=http($url.$salt);
-        echo $data;
-        break;
-
-      case 'graph':
-        // Endpoint for fetching recent killmails to generate the Interaction Matrix (Heat Map).
-        $id=$post_data['id']??0;
-        if(!$id) throw new Exception('Invalid character ID for graph');
-
-        // The graph relies on the latest 100 killmails/losses for real-time interaction assessment, so no database caching is applied here.
-        $zkb_url='https://zkillboard.com/api/kills/characterID/'.$id.'/page/1/';
-        $data=http($zkb_url);
-        echo $data;
-        break;
-
-      case 'logo':
-        // Endpoint for fetching and serving corporation/alliance logos, utilizing a local 30-day cache.
-        $id=$_GET['id']??0;
-        $type=$_GET['type']??'';
-        $size=$_GET['size']??64;
-
-        if($type!='corp' && $type!='alli') throw new Exception('Invalid type for logo');
-        if(!$id) throw new Exception('Invalid ID for logo');
-
-        $db=db();
-        // Check local logo cache
-        $stmt=$db->prepare("SELECT img_data FROM logos WHERE id=? AND type=? AND updated_at > datetime('now', '-30 day')");
-        $stmt->execute([$id, $type]);
-        $img_data=$stmt->fetchColumn();
-
-        if(!$img_data){
-            // Fetch fresh logo from ESI
-            $path=($type=='corp'?'/corporations/':'/alliances/').$id.'/logo/';
-            try {
-                $img_data=http('https://images.evetech.net/'.$path.'?size='.$size, ['timeout'=>5]);
-            } catch(Exception $e){
-                // Fallback mechanism: if the ESI imageserver is down, return the most recent logo from the local cache instead of failing.
-                $stmt=$db->prepare("SELECT img_data FROM logos WHERE id=? AND type=?");
-                $stmt->execute([$id, $type]);
-                $img_data=$stmt->fetchColumn();
-                if(!$img_data) throw new Exception('ESI/DB Error: Failed to fetch/save logo');
-            }
-            
-            // Persist the newly fetched logo (binary BLOB data) to the cache.
-            if($img_data){
-                $stmt=$db->prepare("REPLACE INTO logos (id, type, img_data, updated_at) VALUES (?, ?, ?, datetime('now'))");
-                $stmt->execute([$id, $type, $img_data]);
-            }
-        }
-        
-        // Set image headers and 1-hour public cache for the browser.
-        header('Content-Type: image/png');
-        header('Cache-Control: public, max-age=3600'); 
-        echo $img_data;
-        exit;
-
-      default:
-        throw new Exception('Invalid action');
+    // Odrzucenie po 30 dniach
+    if ($row && strtotime($row['updated_at']) > strtotime('-30 days')) {
+        return $row['img_data'];
     }
 
-  } else {
-    // ------------------------------------------------------------------
-    // FRONTEND HTML (Standard application entry point)
-    // ------------------------------------------------------------------
-?>
-<!DOCTYPE html>
-<html lang="en">
+    // 2. Cache miss lub przestarzały - pobierz z ESI
+    $path = ($type === 'corp' ? 'corporations' : 'alliances');
+    $url = "https://images.evetech.net/{$path}/{$id}/logo?size={$size}";
+    
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS      => 5,
+        CURLOPT_USERAGENT      => UA,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_TIMEOUT        => 30,
+    ]);
+    $img_data = curl_exec($ch);
+    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($http_code === 200 && $img_data && strlen($img_data) > 100) {
+        // Zapisz do bazy danych (SQLite akceptuje BLOB)
+        $st = $db->prepare("INSERT OR REPLACE INTO logos (id, type, img_data, updated_at) VALUES (:id, :type, :data, datetime('now'))");
+        $st->execute([':id' => $key, ':type' => $keyType, ':data' => $img_data]);
+        return $img_data;
+    }
+    
+    // 3. Jeśli pobieranie się nie powiodło, zwróć stary (nawet przestarzały) obrazek
+    if ($row) {
+        return $row['img_data'];
+    }
+
+    // 4. Całkowity brak
+    return false; 
+}
+
+
+if (isset($_GET['action']) && $_GET['action'] === 'logo') {
+    // --- NOWA AKCJA: SERWOWANIE LOGO Z BUFORA ---
+    $id = isset($_GET['id']) ? intval($_GET['id']) : 0;
+    $type = isset($_GET['type']) && in_array($_GET['type'], ['corp', 'alli']) ? $_GET['type'] : null;
+    $size = isset($_GET['size']) ? intval($_GET['size']) : 64;
+    
+    if (!$id || !$type) {
+        http_response_code(404);
+        exit;
+    }
+    
+    $img_data = db_fetch_logo($type, $id, $size);
+
+    if ($img_data) {
+        header('Content-Type: image/png'); // Wszystkie loga ESI to PNG
+        header('Cache-Control: max-age=3600, public'); // Cache w przeglądarce na 1 godzinę
+        echo $img_data;
+    } else {
+        http_response_code(404);
+    }
+    exit;
+}
+
+// Reszta istniejących akcji (zkbByUrl, zkbSalt, resolveBatch, pilot, stats, top, graph, diag)
+
+if (isset($_GET['action']) && $_GET['action'] === 'zkbByUrl') {
+    header('Content-Type: application/json; charset=utf-8');
+    // ... (pozostały kod akcji zkbByUrl) ...
+    $url = '';
+    $raw = file_get_contents('php://input');
+    $ct  = isset($_SERVER['CONTENT_TYPE']) ? strtolower(trim($_SERVER['CONTENT_TYPE'])) : '';
+    if ($raw && strpos($ct,'application/json')===0) { $j=json_decode($raw,true); if(is_array($j)&&isset($j['url'])) $url=(string)$j['url']; }
+    if (!$url && $raw && strpos($ct,'application/x-www-form-urlencoded')===0) { parse_str($raw,$arr); if(isset($arr['url'])) $url=(string)$arr['url']; }
+    if (!$url && $raw && preg_match('~^https://~i', trim($raw))) { $url=trim($raw); }
+    // handle raw "url=..." even when content-type is text/plain
+    if (!$url && $raw and strpos($raw, 'url=') === 0) { parse_str($raw, $arr2); if(isset($arr2['url'])) $url=(string)$arr2['url']; }
+    if (!$url && isset($_POST['url'])) $url=(string)$_POST['url'];
+    if (!$url && isset($_GET['url']))  $url=(string)$_GET['url'];
+    if ($url && stripos($url,'cache/24hour/killlist/?s=')!==false && isset($_GET['u']) && strpos($url,'&u=')===false) { $url .= (strpos($url,'?')!==false?'&':'?') . 'u=' . $_GET['u']; }
+    if (!$url) { http_response_code(400); echo json_encode(['error'=>'missing url']); exit; }
+    // whitelist (case-insensitive), allow trailing slash optional
+    $re='~^https://zkillboard\.com/cache/24hour/killlist/\?s=\d{1,12}&u=/character/\d+/(?:|page/\d+/?|losses/|losses/page/\d+/?)(?:#.*)?$~i';
+    if (!preg_match($re, $url)) { http_response_code(400); echo json_encode(['error'=>'bad url','url'=>$url]); exit; }
+    // ensure encoded u= and build referer path
+    $refererPath = null; $q=parse_url($url,PHP_URL_QUERY); if($q){ parse_str($q,$qp); if(isset($qp['u'])) $refererPath=rawurldecode($qp['u']); }
+    $url = preg_replace_callback('~([?&])u=([^&]+)~', function($m){ $uDec=rawurldecode($m[2]); return $m[1].'u='.rawurlencode($uDec); }, $url);
+    // helper to fetch
+    $fetch=function($u,$ref,$insecure=false){
+        $ch=curl_init($u);
+        $opts=[CURLOPT_RETURNTRANSFER=>true,CURLOPT_FOLLOWLOCATION=>true,CURLOPT_MAXREDIRS=>10,
+               CURLOPT_USERAGENT=>'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+               CURLOPT_HTTPHEADER=>['Accept: application/json, text/plain, */*','Accept-Language: en-US,en;q=0.9',$ref?('Referer: https://zkillboard.com'.$ref):'Referer: https://zkillboard.com/'],
+               CURLOPT_ENCODING=>'',CURLOPT_TIMEOUT=>15];
+        curl_setopt_array($ch,$opts);
+        $body=curl_exec($ch); $info=['status'=>curl_getinfo($ch,CURLINFO_RESPONSE_CODE),'ctype'=>curl_getinfo($ch,CURLINFO_CONTENT_TYPE),'effective'=>curl_getinfo($ch,CURLINFO_EFFECTIVE_URL),'errno'=>curl_errno($ch),'err'=>curl_error($ch)];
+        curl_close($ch); return [$body,$info];
+    };
+    // try 1
+    list($body,$info)=$fetch($url,$refererPath,false);
+    $isJson = ($body!==false && $body!=='') && ((stripos((string)$info['ctype'],'application/json')!==false) || preg_match('~^\s*[\[{]~',$body));
+    if($isJson){ echo $body; exit; }
+    // try 2 via effective URL
+    $eff = isset($info['effective'])?$info['effective']:null;
+    if($eff && preg_match('~^https://zkillboard\.com/cache/24hour/killlist/\?s=\d{1,12}&u=~i',$eff)){
+        $eff = preg_replace_callback('~([?&])u=([^&]+)~', function($m){ $uDec=rawurldecode($m[2]); return $m[1].'u='.rawurlencode($uDec); }, $eff);
+        list($body2,$info2)=$fetch($eff,$refererPath,false);
+        $isJson2 = ($body2!==false && $body2!=='') && ((stripos((string)$info2['ctype'],'application/json')!==false) || preg_match('~^\s*[\[{]~',$body2));
+        if($isJson2){ echo $body2; exit; }
+        http_response_code(502); echo json_encode(['error'=>'html_instead_of_json','status'=>$info2['status'],'effective'=>$eff,'len'=>strlen((string)$body2),'errno'=>$info2['errno'],'err'=>$info2['err']]); exit;
+    }
+    http_response_code(502); echo json_encode(['error'=>'html_instead_of_json','status'=>$info['status'],'effective'=>$info['effective'],'len'=>strlen((string)$body),'errno'=>$info['errno'],'err'=>$info['err']]); exit;
+}
+if (isset($_GET['action']) && $_GET['action'] === 'zkbSalt') {
+    $u = 'https://zkillboard.com/';
+    $ch = curl_init($u);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS      => 5,
+        CURLOPT_USERAGENT      => UA,
+        CURLOPT_HTTPHEADER     => ['Accept: text/html'],
+        CURLOPT_ENCODING       => '',     // gzip/deflate
+        CURLOPT_TIMEOUT        => 10,
+    ]);
+    $html = curl_exec($ch);
+    $err  = curl_error($ch);
+    curl_close($ch);
+    header('Content-Type: application/json; charset=utf-8');
+    if ($html === false || !$html) {
+        http_response_code(502);
+        echo json_encode(['error' => $err ?: 'no body']);
+        exit;
+    }
+    // Szukamy najpierw konkretnego wzorca z cache killlist (najbezpieczniej)
+    if (preg_match('~killlist/\?s=(\d{8})&u=/character/~', $html, $m)) {
+        echo json_encode(['s' => $m[1]]);
+        exit;
+    }
+    // Alternatywnie dowolne "s=########"
+    if (preg_match('~[^\w]s=(\d{8})[^\d]~', $html, $m)) {
+        echo json_encode(['s' => $m[1]]);
+        exit;
+    }
+    http_response_code(404);
+    echo json_encode(['error' => 'marker_not_found']);
+    exit;
+}
+
+
+// --- Error handling & logging (shows errors only on main page, logs always) ---
+$__act = isset($_GET['action'])? $_GET['action'] : '';
+@ini_set('log_errors','1');
+@ini_set('error_log', __DIR__.'/php_error.log');
+@ini_set('display_errors', $__act ? '0' : '1');
+
+/* ============================== ONE-FILE APP (auto-group) ============================== */
+$uri = isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : '';
+if (preg_match('~/favicon\.ico$~i', $uri)) { http_response_code(204); exit; }
+if (function_exists('header_remove')) { header_remove('X-Powered-By'); }
+
+/* ---- HTTP ---- */
+function http_get($url, $acceptJson=true){
+  $ch=curl_init($url);
+  $headers = $acceptJson ? ['Accept: application/json','Accept-Encoding: gzip, deflate'] : ['Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.8','Accept-Encoding: gzip, deflate'];
+  curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>1, CURLOPT_USERAGENT=>UA, CURLOPT_CONNECTTIMEOUT=>12, CURLOPT_TIMEOUT=>30, CURLOPT_FOLLOWLOCATION=>1, CURLOPT_HTTPHEADER=>$headers, CURLOPT_ENCODING=>'']);
+  $b=curl_exec($ch);
+  if($acceptJson && $b && strlen($b)>0 && ($b[0]=='<' || stripos($b,'<!DOCTYPE')===0)) $b=null; // html -> null
+  if($b!==false && strncmp($b,"\x1F\x8B",2)===0){ $b=@gzdecode($b); }
+  curl_close($ch); return $b?:null;
+}
+function http_post_json($url,$payload){ $ch=curl_init($url); curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>1, CURLOPT_USERAGENT=>UA, CURLOPT_HTTPHEADER=>['Content-Type: application/json'], CURLOPT_POST=>1, CURLOPT_POSTFIELDS=>json_encode($payload), CURLOPT_CONNECTTIMEOUT=>12, CURLOPT_TIMEOUT=>30, CURLOPT_FOLLOWLOCATION=>1, CURLOPT_ENCODING=>'']); $b=curl_exec($ch); if($b!==false && strncmp($b,"\x1F\x8B",2)===0){ $b=@gzdecode($b); } curl_close($ch); return $b?:null; }
+
+/* ---- UTILS ---- */
+function mb_len($s){ return function_exists('mb_strlen')? mb_strlen($s,'UTF-8') : strlen($s); }
+function low($s){ return function_exists('mb_strtolower')? mb_strtolower($s,'UTF-8') : strtolower($s); }
+function err($m,$c=400){ http_response_code($c); header('Content-Type: application/json'); echo json_encode(['ok'=>false,'error'=>$m]); exit; }
+function ok($p){ header('Content-Type: application/json'); if(is_array($p)&&!array_key_exists('ok',$p)) $p['ok']=true; echo json_encode($p); exit; }
+function jget(){ $b=file_get_contents('php://input'); $j=json_decode($b,true); return is_array($j)?$j:[]; }
+function clean($s){ $s=trim($s); $s=preg_replace('/[\x{200B}-\x{200D}\x{FEFF}]/u','',$s); $s=preg_replace('/\s+/u',' ',$s); return $s; }
+function pick($arr,$cands,$def=null){ foreach($cands as $k){ if(is_array($k)){ $cur=$arr; $ok=true; foreach($k as $kk){ if(is_array($cur) && isset($cur[$kk])) $cur=$cur[$kk]; else { $ok=false; break; } } if($ok) return $cur; } else { if(isset($arr[$k])) return $arr[$k]; } } return $def; }
+
+/* ---- ESI ---- */
+function esi_character($id){ $b=http_get("https://esi.evetech.net/latest/characters/".intval($id)."/"); if(!$b) return null; $a=json_decode($b,true);
+  $corp = isset($a['corporation_id'])? intval($a['corporation_id']) : 0; $corpName=''; $allyId=0; $allyName='';
+  if($corp){ $c=http_get("https://esi.evetech.net/latest/corporations/$corp/"); $cc=$c?json_decode($c,true):[]; $corpName=isset($cc['name'])?$cc['name']:''; $allyId=isset($cc['alliance_id'])? intval($cc['alliance_id']) : 0; }
+  if(!$allyId && isset($a['alliance_id'])) $allyId=intval($a['alliance_id']);
+  if($allyId){ $al=http_get("https://esi.evetech.net/latest/alliances/$allyId/"); $aa=$al?json_decode($al,true):[]; $allyName=isset($aa['name'])?$aa['name']:''; }
+  return ['id'=>intval($id),'name'=>isset($a['name'])?$a['name']:'','birthday'=>isset($a['birthday'])?$a['birthday']:'','corp_id'=>$corp,'corp_name'=>$corpName,'alliance_id'=>$allyId,'alliance_name'=>$allyName]; }
+
+/* ---- zKillboard ---- */
+// *** TA FUNKCJA JUŻ NIE JEST UŻYWANA, ALE ZOSTAWIAMY JĄ ***
+function zkb_stats($id){ $b=http_get("https://zkillboard.com/api/stats/characterID/".intval($id)."/"); if(!$b) return null; $a=json_decode($b,true); if(!is_array($a)) return null; $kills=isset($a['shipsDestroyed'])?intval($a['shipsDestroyed']):0; $losses=isset($a['shipsLost'])?intval($a['shipsLost']):0; $solo = isset($a['soloKills'])? intval($a['soloKills']) : null; if($solo===null){ $gangRatio = isset($a['gangRatio'])? floatval($a['gangRatio']) : 0.0; $solo = round($kills * (1.0 - max(0.0, min(1.0,$gangRatio/100.0)))); } $group=isset($a['gangKills'])?intval($a['gangKills']):($kills-$solo); $danger=isset($a['dangerRatio'])?floatval($a['dangerRatio']):0.0; return [$kills,$losses,$solo,$group,$danger]; }
+function zkb100($id){ $b=http_get("https://zkillboard.com/api/kills/characterID/".intval($id)."/page/1/"); $a=$b?json_decode($b,true):[]; return is_array($a)?array_slice($a,0,100):[]; }
+
+/* ---- TopAllTime HTML parser + API fallback ---- */
+function zkb_top10_html($id){ 
+    if(!class_exists('DOMDocument')) return ['ships'=>[], 'systems'=>[], 'alliances'=>[]]; 
+    $html=http_get("https://zkillboard.com/character/".intval($id)."/topalltime/", false); 
+    if(!$html) return ['ships'=>[], 'systems'=>[], 'alliances'=>[]]; 
+    libxml_use_internal_errors(true); $dom=new DOMDocument(); @$dom->loadHTML($html); libxml_clear_errors(); $xp=new DOMXPath($dom); 
+    $ships=[]; $systems=[]; $alliances=[];
+    $extract=function($node){ 
+        $cur=$node; while($cur && strtolower($cur->nodeName)!=='tr'){ $cur=$cur->parentNode; } 
+        $txt=$cur? trim(preg_replace('/\s+/', ' ', $cur->textContent)) : trim($node->textContent); 
+        if($txt==='') return 0; 
+        if(preg_match_all('/(\d[\d,.]*)/', $txt, $m) && count($m[1])){ $s=end($m[1]); $s=str_replace([',','.'],'',$s); return intval($s); } 
+        return 0; 
+    }; 
+    // Ships
+    foreach($xp->query("//a[contains(@href,'/ship/')]") as $a){ $name=trim($a->textContent); if($name==='') continue; $ships[]=['name'=>$name, 'kills'=>$extract($a)]; if(count($ships)>=30) break; } 
+    // Systems
+    foreach($xp->query("//a[contains(@href,'/system/')]") as $a){ $name=trim($a->textContent); if($name==='') continue; $systems[]=['name'=>$name, 'kills'=>$extract($a)]; if(count($systems)>=30) break; } 
+    // Alliances (szukamy linków do alliance/ lub alliances/)
+    foreach($xp->query("//a[contains(@href,'/alliance/')]|//a[contains(@href,'/alliances/')]") as $a){ $name=trim($a->textContent); if($name==='') continue; $alliances[]=['name'=>$name, 'kills'=>$extract($a)]; if(count($alliances)>=30) break; }
+
+    $agg=function($arr){ 
+        $m=[]; foreach($arr as $x){ $k=low($x['name']); if(!isset($m[$k])) $m[$k]=['name'=>$x['name'],'kills'=>0]; $m[$k]['kills']+=intval($x['kills']); } 
+        $out=array_values($m); usort($out,function($a,$b){ $d=($b['kills'] <=> $a['kills']); return $d? $d : strcmp($a['name'],$b['name']); }); return array_slice($out,0,10); 
+    }; 
+    return ['ships'=>$agg($ships), 'systems'=>$agg($systems), 'alliances'=>$agg($alliances)]; 
+}
+
+function zkb_top10_api($id){ 
+    $b=http_get("https://zkillboard.com/api/stats/characterID/".intval($id)."/"); 
+    if(!$b) return ['ships'=>[], 'systems'=>[], 'alliances'=>[]]; 
+    $j=json_decode($b,true); if(!is_array($j)) return ['ships'=>[], 'systems'=>[], 'alliances'=>[]]; 
+    $topLists=isset($j['topLists'])?$j['topLists']:[]; 
+    $ships=[]; $systems=[]; $alliances=[];
+    foreach($topLists as $tl){ 
+        $type=strtolower(isset($tl['type'])?$tl['type']:''); 
+        $data=isset($tl['data']) && is_array($tl['data']) ? $tl['data'] : []; 
+        if(strpos($type,'ship')!==false){ 
+            foreach($data as $d){ $name = pick($d,['shipType','shipTypeName','name'],''); if(is_array($name)) $name = pick($name,['name'],''); $cnt=intval(pick($d,['kills','count'],0)); if($name!=='') $ships[]=['name'=>$name,'kills'=>$cnt]; } 
+        } 
+        if(strpos($type,'solarsystem')!==false){ 
+            foreach($data as $d){ $name = pick($d,['solarSystemName','solarSystem','name'],''); if(is_array($name)) $name = pick($name,['name'],''); $cnt=intval(pick($d,['kills','count'],0)); if($name!=='') $systems[]=['name'=>$name,'kills'=>$cnt]; } 
+        } 
+        if(strpos($type,'alliance')!==false){ 
+            foreach($data as $d){ $name = pick($d,['allianceName','alliance','name'],''); if(is_array($name)) $name = pick($name,['name'],''); $cnt=intval(pick($d,['kills','count'],0)); if($name!=='') $alliances[]=['name'=>$name,'kills'=>$cnt]; } 
+        }
+    } 
+    $norm=function($arr){ 
+        $m=[]; foreach($arr as $x){ $k=low($x['name']); if(!isset($m[$k])) $m[$k]=['name'=>$x['name'],'kills'=>0]; $m[$k]['kills']+=intval($x['kills']); } 
+        $out=array_values($m); usort($out,function($a,$b){ $d=($b['kills'] <=> $a['kills']); return $d? $d : strcmp($a['name'],$b['name']); }); return array_slice($out,0,10); 
+    }; 
+    return ['ships'=>$norm($ships), 'systems'=>$norm($systems), 'alliances'=>$norm($alliances)]; 
+}
+
+// Fallback: build Top from last 100 killmails
+function zkb_top_from_recent($id){
+  $km = zkb100($id);
+  if(!$km || !is_array($km)) return ['ships'=>[], 'systems'=>[], 'alliances'=>[]];
+  $shipCounts = []; $sysCounts = []; $alliCounts = [];
+  foreach($km as $k){
+    $vic = isset($k['victim']) ? $k['victim'] : [];
+    
+    // Ship
+    $tid = isset($vic['ship_type_id']) ? intval($vic['ship_type_id']) : 0;
+    if($tid){ $shipCounts[$tid] = isset($shipCounts[$tid]) ? $shipCounts[$tid]+1 : 1; }
+    
+    // System
+    $sid = isset($k['solar_system_id']) ? intval($k['solar_system_id']) : 0;
+    if($sid){ $sysCounts[$sid] = isset($sysCounts[$sid]) ? $sysCounts[$sid]+1 : 1; }
+    
+    // Alliance (of victim)
+    $aid = isset($vic['alliance_id']) ? intval($vic['alliance_id']) : 0;
+    if($aid){ $alliCounts[$aid] = isset($alliCounts[$aid]) ? $alliCounts[$aid]+1 : 1; }
+  }
+  arsort($shipCounts); arsort($sysCounts); arsort($alliCounts);
+  
+  $ships=[]; $systems=[]; $alliances=[];
+  
+  $i=0; foreach($shipCounts as $tid=>$cnt){
+    $name=''; $class='';
+    $tb=http_get('https://esi.evetech.net/latest/universe/types/'.intval($tid).'/');
+    if($tb){ $ta=json_decode($tb,true); $name = isset($ta['name'])?$ta['name']:('type '.$tid); $gid=isset($ta['group_id'])?intval($ta['group_id']):0; if($gid){ $gb=http_get('https://esi.evetech.net/latest/universe/groups/'.$gid.'/'); $ga=$gb?json_decode($gb,true):[]; $class=isset($ga['name'])?$ga['name']:''; } }
+    if(!$name) $name='type '.$tid;
+    $ships[]=['name'=>$name,'kills'=>intval($cnt),'type_id'=>$tid,'class'=>$class];
+    if(++$i>=10) break;
+  }
+  
+  $i=0; foreach($sysCounts as $sid=>$cnt){
+    $name=''; $sb=http_get('https://esi.evetech.net/latest/universe/systems/'.intval($sid).'/');
+    if($sb){ $sa=json_decode($sb,true); $name=isset($sa['name'])?$sa['name']:('system '.$sid); }
+    if(!$name) $name='system '.$sid;
+    $systems[]=['name'=>$name,'kills'=>intval($cnt),'system_id'=>$sid];
+    if(++$i>=10) break;
+  }
+  
+  $i=0; foreach($alliCounts as $aid=>$cnt){
+    $name=''; $ab=http_get('https://esi.evetech.net/latest/alliances/'.intval($aid).'/');
+    if($ab){ $aa=json_decode($ab,true); $name=isset($aa['name'])?$aa['name']:('alliance '.$aid); }
+    if(!$name) $name='alliance '.$aid;
+    $alliances[]=['name'=>$name,'kills'=>intval($cnt),'alliance_id'=>$aid];
+    if(++$i>=10) break;
+  }
+  
+  return ['ships'=>$ships, 'systems'=>$systems, 'alliances'=>$alliances];
+}
+
+/* ---- ROUTES ---- */
+$act = isset($_GET['action'])? $_GET['action'] : '';
+
+if($act==='resolveBatch'){
+  $j=jget(); $names=isset($j['names'])?$j['names']:[]; if(!is_array($names)) err('bad input');
+  $payload=array_values(array_unique(array_filter(array_map('clean',$names), function($x){ return mb_len($x)>=3; })));
+  if(!$payload) ok(['map'=>[], 'unmatched'=>[]]);
+  $map=[]; $un=$payload; $r=http_post_json('https://esi.evetech.net/latest/universe/ids/', $payload);
+  if($r){ $jj=json_decode($r,true); $chars=isset($jj['characters'])?$jj['characters']:[]; foreach($chars as $c){ $map[low($c['name'])]=$c['id']; } $un=array_values(array_filter($payload, function($n)use($map){ return !isset($map[low($n)]); })); }
+  if(count($un)){
+    foreach($un as $n){ foreach(['true','false'] as $strict){ $q='https://esi.evetech.net/latest/search/?categories=character&search='.rawurlencode($n).'&strict='.$strict; $b=http_get($q); $a=$b?json_decode($b,true):[]; $ids=isset($a['character'])?$a['character']:[]; if($ids){ $id=intval($ids[0]); $pi=esi_character($id); if($pi) $map[low($pi['name'])]=$pi['id']; break; } } }
+  }
+  $unmatched=array_values(array_filter($payload, function($n)use($map){ return !isset($map[low($n)]); }));
+  ok(['map'=>$map,'unmatched'=>$unmatched]);
+}
+
+if($act==='pilot'){
+  $j=jget(); $id=intval(isset($j['id'])?$j['id']:0); if(!$id) err('no id'); $pi=esi_character($id); if(!$pi) err('esi fail');
+  $dbh=db(); $st=$dbh->prepare("INSERT INTO characters(id,name,birthday,corp_id,corp_name,alliance_id,alliance_name,updated_at) VALUES(:i,:n,:b,:ci,:cn,:ai,:an,datetime('now')) ON CONFLICT(id) DO UPDATE SET name=excluded.name,birthday=excluded.birthday,corp_id=excluded.corp_id,corp_name=excluded.corp_name,alliance_id=excluded.alliance_id,alliance_name=excluded.alliance_name,updated_at=datetime('now')");
+  $st->execute([':i'=>$pi['id'],':n'=>$pi['name'],':b'=>$pi['birthday'],':ci'=>$pi['corp_id'],':cn'=>$pi['corp_name'],':ai'=>$pi['alliance_id'],':an'=>$pi['alliance_name']]);
+  ok(['pilot'=>$pi]);
+}
+
+if($act==='stats'){
+  $j=jget(); $id=intval(isset($j['id'])?$j['id']:0); if(!$id) err('no id');
+  
+  // *** POPRAWKA: Pobieramy cały obiekt $a z zkb, a nie tylko listę ***
+  $b=http_get("https://zkillboard.com/api/stats/characterID/".intval($id)."/");
+  $a=$b?json_decode($b,true):null;
+  
+  if(!$a) { 
+    // Jeśli fetch nie zadziałał, zwróć pusty obiekt, aby app.js się nie zawiesił
+    ok(['stats'=>['shipsDestroyed'=>0,'shipsLost'=>0,'soloKills'=>0,'gangKills'=>0,'dangerRatio'=>0, 'labels'=>null]]);
+    exit;
+  }
+  
+  // Zapisz kluczowe statystyki do lokalnej bazy danych (jak wcześniej)
+  $k = isset($a['shipsDestroyed'])?intval($a['shipsDestroyed']):0;
+  $l = isset($a['shipsLost'])?intval($a['shipsLost']):0;
+  $s = isset($a['soloKills'])? intval($a['soloKills']) : 0; 
+  $g = isset($a['gangKills'])?intval($a['gangKills']):($k-$s);
+  $d = isset($a['dangerRatio'])?floatval($a['dangerRatio']):0.0;
+  
+  $dbh=db();
+  $st=$dbh->prepare("INSERT INTO stats(char_id,kills,losses,solo,group_kills,danger,updated_at) VALUES(:i,:k,:l,:s,:g,:d,datetime('now')) ON CONFLICT(char_id) DO UPDATE SET kills=excluded.kills,losses=excluded.losses,solo=excluded.solo,group_kills=excluded.group_kills,danger=excluded.danger,updated_at=datetime('now')");
+  $st->execute([':i'=>$id,':k'=>$k,':l'=>$l,':s'=>$s,':g'=>$g,':d'=>$d]);
+
+  // *** POPRAWKA: Zwracamy cały obiekt $a (JSON z zkb) jako 'stats' ***
+  ok(['stats'=>$a]);
+}
+
+if($act==='top'){
+  $j=jget(); $id=intval(isset($j['id'])?$j['id']:0); if(!$id) err('no id');
+  $dbh=db();
+  $ships=[]; $systems=[]; $alliances=[]; $corpId=0; $alliId=0;
+
+  // 1) try cache
+  $row=null; $st=$dbh->prepare("SELECT ships_json, systems_json, alliances_json FROM top WHERE char_id=:i"); $st->execute([':i'=>$id]); $row=$st->fetch(PDO::FETCH_ASSOC);
+  if($row){ 
+      $ships=json_decode($row['ships_json']?:'[]',true)?:[]; 
+      $systems=json_decode($row['systems_json']?:'[]',true)?:[]; 
+      $alliances=json_decode(isset($row['alliances_json'])?$row['alliances_json']:'[]',true)?:[]; 
+  }
+
+  // 2) try to learn aff ids from /topalltime/ html (header links)
+  if(class_exists('DOMDocument')){
+    $html=http_get("https://zkillboard.com/character/".$id."/topalltime/", false);
+    if($html){ if(preg_match('~/(?:corporation|corporations)/(\d+)~',$html,$m)) $corpId=intval($m[1]); if(preg_match('~/(?:alliance|alliances)/(\d+)~',$html,$m2)) $alliId=intval($m2[1]); }
+  }
+
+  // 3) if empty -> pull fresh
+  if(!$ships || !$systems || !$alliances){
+    $top = zkb_top10_html($id);
+    if((!$top['ships'] && !$top['systems'] && !$top['alliances'])){ $top = zkb_top10_api($id); }
+    if((!$top['ships'] && !$top['systems'] && !$top['alliances'])){ $top = zkb_top_from_recent($id); }
+    $ships=$top['ships']; $systems=$top['systems']; $alliances=$top['alliances'];
+    
+    // cache only if we actually have some data
+    if(($ships && count($ships)) || ($systems && count($systems)) || ($alliances && count($alliances))){
+      $st2=$dbh->prepare("INSERT INTO top(char_id, ships_json, systems_json, alliances_json, updated_at) VALUES(:i,:s,:y,:a,datetime('now')) ON CONFLICT(char_id) DO UPDATE SET ships_json=excluded.ships_json, systems_json=excluded.systems_json, alliances_json=excluded.alliances_json, updated_at=datetime('now')");
+      $st2->execute([':i'=>$id, ':s'=>json_encode($ships), ':y'=>json_encode($systems), ':a'=>json_encode($alliances)]);
+    }
+  }
+
+  // 4) update characters with aff if found
+  if($corpId || $alliId){ $dbh->prepare("UPDATE characters SET corp_id=COALESCE(NULLIF(:ci,0),corp_id), alliance_id=COALESCE(NULLIF(:ai,0),alliance_id) WHERE id=:i")->execute([':ci'=>$corpId, ':ai'=>$alliId, ':i'=>$id]); }
+
+  ok(['top'=>['ships'=>$ships,'systems'=>$systems,'alliances'=>$alliances,'corp_id'=>$corpId,'alliance_id'=>$alliId]]);
+}
+
+if($act==='graph'){
+  $j=jget(); $ids=array_values(array_unique(array_map('intval', isset($j['ids'])?$j['ids']:[]))); if(count($ids)<2) ok(['nodes'=>$ids,'matrix'=>[]]);
+  $idx=[]; foreach($ids as $i=>$id) $idx[$id]=$i; $n=count($ids); $M=array_fill(0,$n, array_fill(0,$n,0.0));
+  foreach($ids as $attId){ $km=zkb100($attId); foreach($km as $k){ $when=strtotime(isset($k['killmail_time'])?$k['killmail_time']:''); $days = $when? max(0,(time()-$when)/86400.0): 365; $recency = 0.5 + 1.5 * max(0.0, 1.0 - min(1.0,$days/60.0)); $final = (isset($k['zkb']['finalBlow']) && $k['zkb']['finalBlow']) ? 0.3 : 0.0; $soloKill = (isset($k['zkb']['solo']) && $k['zkb']['solo']) ? 0.2 : 0.0; $weight = $recency + $final + $soloKill; $atts=isset($k['attackers'])?$k['attackers']:[]; foreach($atts as $att){ $aid=intval(isset($att['character_id'])?$att['character_id']:0); if(!$aid) continue; foreach($atts as $opp){ $bid=intval(isset($opp['character_id'])?$opp['character_id']:0); if(!$bid||$aid===$bid) continue; if(!isset($idx[$aid])||!isset($idx[$bid])) continue; $M[$idx[$aid]][$idx[$bid]] += $weight; } } } }
+  $dbh=db(); $meta=['corp'=>[],'alli'=>[],'name'=>[]]; $in=implode(',',array_map('intval',$ids)); $q=$dbh->query("SELECT id,corp_id,alliance_id,name FROM characters WHERE id IN ($in)"); while($r=$q->fetch(PDO::FETCH_ASSOC)){ $meta['corp'][intval($r['id'])]=intval($r['corp_id']); $meta['alli'][intval($r['id'])]=intval($r['alliance_id']); $meta['name'][intval($r['id'])]=$r['name']; }
+  ok(['nodes'=>$ids,'matrix'=>$M,'meta'=>$meta]);
+}
+
+if($act==='diag'){
+  $exts = get_loaded_extensions();
+  $info = [
+    'php' => PHP_VERSION,
+    'ext' => [
+      'curl' => in_array('curl',$exts),
+      'dom' => class_exists('DOMDocument'),
+      'mbstring' => in_array('mbstring',$exts),
+      'sqlite' => in_array('sqlite3',$exts) || in_array('pdo_sqlite',$exts),
+    ],
+    'ua' => UA,
+    'db_path' => DB,
+    'writable' => is_writable(dirname(DB)),
+    'db_ok' => false,
+  ];
+  try{ db()->exec('PRAGMA user_version=1'); $info['db_ok']=true; }
+  catch(Exception $e){ $info['db_error']=$e->getMessage(); }
+  ok(['diag'=>$info]);
+}
+
+/* ---- HTML/JS ---- */
+?><!doctype html>
+<html>
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>evecia - Pilot Analysis</title>
-  <style>
-    body{ font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; background-color:#f7f7fb; color:#111; margin:0; padding:0; }
-    main{ padding:20px; }
-    .container{ max-width:1200px; margin:0 auto; display:flex; gap:20px; }
-    .main-content{ flex:1; min-width:600px; }
-    .sidebar{ width:350px; background:#fff; padding:15px; border-radius:.5rem; box-shadow:0 4px 12px rgba(0,0,0,.1); height:fit-content; }
-    h1{ font-size:1.8em; color:#333; margin-top:0; border-bottom:1px solid #eee; padding-bottom:5px; }
-    .input-group{ margin-bottom:15px; }
-    textarea{ width:100%; height:150px; padding:10px; border:1px solid #ddd; border-radius:.5rem; box-sizing:border-box; font-family:monospace; font-size:.9em; }
-    button{ padding:10px 15px; border:none; border-radius:.5rem; cursor:pointer; font-weight:bold; }
-    #go{ background-color:#007bff; color:#fff; }
-    #go:disabled{ background-color:#ccc; cursor:not-allowed; }
-    .button-group{ display:flex; gap:10px; margin-top:10px; }
-    .button-group button{ flex:1; background-color:#f0f0f0; color:#333; }
-    .button-group button:hover{ background-color:#e0e0e0; }
-    #status{ margin-top:15px; font-weight:bold; color:#555; }
-    .main-table{ width:100%; border-collapse:collapse; margin-top:20px; background:#fff; border-radius:.5rem; overflow:hidden; box-shadow:0 4px 12px rgba(0,0,0,.05); }
-    .main-table th, .main-table td{ padding:10px; border-bottom:1px solid #eee; text-align:left; }
-    .main-table th{ background-color:#f5f5f5; cursor:pointer; }
-    .main-table th.sort-asc:after{ content:"▲"; margin-left:5px; }
-    .main-table th.sort-desc:after{ content:"▼"; margin-left:5px; }
-    .main-table tr:hover{ background-color:#fafafa; }
-    .main-table img{ vertical-align:middle; border-radius:3px; margin-right:5px; }
-    .matrix-container{ margin-top:20px; padding:15px; background:#fff; border-radius:.5rem; box-shadow:0 4px 12px rgba(0,0,0,.05); }
-    .matrix-table{ width:100%; border-collapse:collapse; table-layout:fixed; }
-    .matrix-table th, .matrix-table td{ padding:5px; border:1px solid #eee; text-align:center; font-size:.8em; overflow:hidden; }
-    .matrix-table th{ background-color:#f5f5f5; font-weight:normal; }
-    .matrix-table th:first-child{ width:15%; }
-    .matrix-cell{ width:100%; height:100%; display:block; }
-    #top-panel-wrap{ margin-top:20px; }
-    #top-panel-content{ background:#fff; padding:15px; border:1px solid #ddd; border-radius:.5rem; margin-top:10px; }
-    #top-panel-content ul{ list-style:none; padding:0; margin:0; }
-    #top-panel-content li{ padding:5px 0; border-bottom:1px solid #eee; }
-    #top-panel-content li:last-child{ border-bottom:none; }
-    .help-row{ text-align:right; margin-top:20px; }
-    .help-link{ color:#007bff; text-decoration:none; font-weight:bold; }
-  </style>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>evecia</title>
+<style>
+/* ZACHOWANE I NOWE STYLE */
+:root{ --bg:#f7f7fb; --ink:#111; --muted:#666; --b:#e8e8ee; }
+*{box-sizing:border-box} body{margin:0;font:14px/1.4 system-ui, -apple-system, Segoe UI, Roboto,sans-serif;background:var(--bg);color:var(--ink)}
+header{position:sticky;top:0;z-index:5;background:#fff;border-bottom:1px solid var(--b)} 
+header .wrap{max-width:1200px;margin:0 auto;padding:6px 16px;display:flex;gap:12px;align-items:center} 
+main{max-width:1200px;margin:0 auto;padding:16px;display:grid;gap:16px;grid-template-columns:1fr 1fr}
+main .right { 
+    max-width: 600px; 
+}
+.btn{background:#111;color:#fff;border:0;padding:8px 10px;border-radius:.4rem;cursor:pointer}.btn:disabled{opacity:.6}
+/* NOWY STYL DLA PRZYCISKÓW MENU (IKON) */
+.menu-btn {
+    /* Ustawienia wizualne */
+    background: transparent;
+    border: 1px solid transparent; 
+    color: var(--ink); 
+    padding: 4px 6px;
+    height: 30px; 
+    width: 30px; 
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 16px; 
+    line-height: 1.5;
+    display: flex; 
+    align-items: center;
+    justify-content: center;
+    transition: background 0.1s;
+}
+.menu-btn:hover {
+    background: #eef3ff; 
+    border: 1px solid #ddd;
+}
+.menu-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+/* STYL KONTENERA PRZYCISKÓW */
+.menu-group {
+    display: flex;
+    gap: 4px; 
+    border: 1px solid #ddd; 
+    border-radius: 4px;
+    padding: 2px;
+}
+.menu-separator {
+    width: 1px;
+    background: #ddd;
+    margin: 4px 6px;
+}
+/* STYL DLA KLASY KLAWISZA (Piktogram) */
+.key-hint {
+    font-size: 11px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    background: #eee;
+    border: 1px solid #ccc;
+    border-radius: 3px;
+    padding: 0 3px;
+    margin-left: 4px;
+    display: inline-block;
+    vertical-align: middle;
+    line-height: 1.4;
+}
+
+textarea{width:100%;min-height:90px;resize:vertical;font:13px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace}
+#tab{width:100%;border-collapse:collapse;font-size:13px} #tab th,#tab td{border-bottom:1px solid var(--b);padding:6px 8px;text-align:left} #tab th{background:#fafafa;position:sticky;top:0;z-index:1}
+#tab tbody tr:hover{background:#f4f8ff}
+.logo{width:36px;height:36px;vertical-align:-10px;margin-right:6px;border-radius:2px;border:1px solid #ddd;background:#fff}
+.group-row{background:#eef3ff}.group-row td{font-weight:700;padding-top:8px}
+.group-alliance td{background:#e8f6ff}
+.group-corp td{background:#f4faff}
+.heat-table{border-collapse:collapse;font-size:12px}.heat-table th,.heat-table td{border:1px solid #ddd;padding:4px;text-align:center}.heat-table .sticky-top{position:sticky;top:0;background:#fff;z-index:1}.heat-table .sticky-col{position:sticky;left:0;background:#fff;z-index:1;font-weight:600}
+#topinfo-container h4{margin:0 0 8px 0;font-size:16px} #topinfo-container .tops{display:flex;gap:24px;flex-wrap:wrap} #topinfo-container .tops>div{flex:1 1 280px} #topinfo-container h5{margin:8px 0;font-size:14px;color:#333} #topinfo-container ol{margin:0;padding-left:20px} #topinfo-container li{display:flex;justify-content:space-between;border-bottom:1px dashed #eee;padding:4px 0} #topinfo-container .cnt{font-variant-numeric:tabular-nums;opacity:.8;margin-left:8px} #topinfo-container .muted{color:#666;font-size:13px}
+#toptab{width:100%;border-collapse:collapse;font-size:12px}
+#toptab th,#toptab td{border:1px solid #eee;padding:4px 6px;text-align:left}
+#toptab th{background:#fafafa}
+/* NOWE STYLE SORTOWANIA */
+#tab th[data-sort]{ cursor: pointer; }
+#tab th[data-sort]:hover{ background: #f0f0f0; }
+#tab th.sort-asc::after { content: ' \25B2'; opacity: 0.8; }
+#tab th.sort-desc::after { content: ' \25BC'; opacity: 0.8; }
+/* STYLI DLA POZIOMEGO ZWIJANIA (POPRAWKA WYSOKOŚCI) */
+#top-panel-wrap {
+    position: sticky; 
+    top: 50px;
+    z-index: 2;
+    background: var(--bg);
+    padding: 16px; 
+    margin-top: -16px;
+    overflow: hidden; 
+    transition: width 0.3s ease-out, transform 0.3s ease-out, height 0.3s ease-out, padding-top 0.3s ease-out, padding-bottom 0.3s ease-out; 
+    width: 100%; 
+    box-sizing: border-box; 
+    transform-origin: right center; 
+}
+#top-panel-wrap.collapsed {
+    width: 40px; 
+    transform: translateX(calc(100% - 40px)); 
+    padding-left: 0;
+    padding-right: 0;
+    padding-top: 5px; 
+    padding-bottom: 5px;
+    height: 40px; 
+}
+#top-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px; 
+    font-size: 1.1em;
+    font-weight: bold;
+    white-space: nowrap;
+    transition: margin-bottom 0.3s ease-out; 
+}
+#top-panel-wrap.collapsed #top-panel-header {
+    margin-bottom: 0; 
+}
+#top-panel-header .title {
+    flex-grow: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: opacity 0.1s;
+}
+#top-panel-wrap.collapsed #top-panel-header .title {
+    opacity: 0; 
+    pointer-events: none;
+}
+#collapse-btn {
+    background: #555;
+    color: #fff;
+    border: 0;
+    width: 30px;
+    height: 30px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 16px;
+    line-height: 1;
+    margin-left: 10px;
+    flex-shrink: 0;
+    transition: transform 0.3s ease;
+}
+#topinfo-content {
+    transition: opacity 0.3s ease 0.1s; 
+}
+.collapsed #topinfo-content {
+    opacity: 0;
+    pointer-events: none; 
+    transition-delay: 0s;
+}
+/* Poprawione style dla linku HELP - stały czerwony kolor i brak podkreślenia */
+.help-link, .help-link:link, .help-link:visited, .help-link:hover, .help-link:active {
+    color: red !important; 
+    text-decoration: none !important; 
+    font-weight: bold; 
+}
+/* STYLE DLA ANIMOWANEJ STRZAŁKI */
+.arrow-container {
+    width: 64px;
+    height: 36px;
+    display: inline-block; 
+    position: relative; 
+    overflow: hidden; 
+    margin-left: 10px; 
+    flex-shrink: 0; 
+}
+
+.help-row {
+    font-size: 25px; 
+    display: flex; 
+    align-items: center;
+}
+
+.arrow-container::before {
+    content: '';
+    width: 0;
+    height: 0;
+    border-top: 18px solid transparent; 
+    border-bottom: 18px solid transparent;
+    border-right: 32px solid red; 
+    position: absolute;
+    right: 0; 
+}
+
+@keyframes slide-arrow {
+    0%, 100% {
+        transform: translateX(0); 
+    }
+    50% {
+        transform: translateX(-32px); 
+    }
+}
+
+.arrow-container::before {
+    animation: slide-arrow 2s ease-in-out infinite;
+}
+</style>
 </head>
 <body>
-<main>
-  <div class="container">
-    <div class="main-content">
-      <h1>evecia Analysis</h1>
-
-      <div class="input-group">
-        <textarea id="memo" placeholder="Enter a list of characters from Local chat (or paste Ctrl+V)"></textarea>
-        <div class="button-group">
-          <button id="go">Analyze</button>
-          <button id="save">Save As (Ctrl+S)</button>
-          <button id="qsave">Quick Save (Ctrl+Q)</button>
-          <button id="open">Open (Ctrl+O)</button>
-        </div>
-        <div id="status">Loading...</div>
-      </div>
-      
-      <div id="tabs">
-        <button onclick="showTab('tab')">Statistics Table</button>
-        <button onclick="showTab('heat')">Interaction Matrix</button>
-        <button onclick="showTab('top')">Top All Time</button>
-      </div>
-
-      <div id="tab-content">
-        <div id="tab" class="tab-pane">
-          <table class="main-table" id="table">
-            <thead>
-              <tr id="table-header"></tr>
-            </thead>
-            <tbody id="table-body">
-              <tr><td colspan="10" style="text-align:center;padding:50px;color:#999">Empty Table</td></tr>
-            </tbody>
-          </table>
-        </div>
+<header>
+    <div class="wrap">
+        <strong>evecia</strong>
         
-        <div id="heat" class="tab-pane" style="display:none;">
-          <div class="matrix-container">
-            <h3 style="margin-top:0;border-bottom:none;">Interaction Matrix</h3>
-            <table class="matrix-table" id="matrix">
-              <tbody id="matrix-body">
-                <tr><td colspan="2" style="text-align:center;padding:50px;color:#999">Empty Table</td></tr>
-              </tbody>
-            </table>
+        <div class="menu-group">
+            <button class="menu-btn" id="open" type="button" title="Open File / Quick Load (Ctrl+O)">
+                <span style="font-size: 18px;">📂</span>
+            </button>
+            <button class="menu-btn" id="save" type="button" title="Save As (Ctrl+S)">
+                <span style="font-size: 18px;">💾</span>
+            </button>
+            <button class="menu-btn" id="qsave" type="button" title="Quick Save (Ctrl+Q)">
+                <span style="font-size: 18px;">⚡</span>
+            </button>
+        </div>
+
+        <div class="menu-separator"></div>
+
+        <div class="menu-group">
+            <button class="menu-btn" id="go" type="button" title="Analyze (Ctrl+Enter)">
+                ▶️
+            </button>
+            <button class="menu-btn" id="clr" type="button" title="Clear All Data">
+                <span style="font-size: 18px;">🗑️</span>
+            </button>
+        </div>
+
+        <div class="menu-separator"></div>
+
+        <div class="menu-group">
+            <button class="menu-btn" id="diag" type="button" title="Run Diagnostics">
+                🛠️
+            </button>
+        </div>
+
+        <span id="st" style="margin-left:auto;color:var(--muted)">Ready</span>
+        <span id="boot" style="margin-left:8px;color:#c00">JS: not loaded</span>
+    </div>
+</header>
+<main>
+  <div class="left">
+    <div class="panel" style="background:#fff;border:1px solid var(--b);border-radius:.5rem;padding:12px">
+      <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px">
+        <div style="flex:1 1 auto">
+          <label for="memo" style="display:block; font-size:12px; color:var(--muted); margin-bottom:4px">Paste the list of pilots (one per line or) from eve online on local ctrl+a ctrl+c and here ctrl+v</label>
+          <div style="display:flex; gap:8px; align-items:center">
+            <textarea id="memo" placeholder="One name per line"></textarea>
+            <button class="btn" id="clr" type="button">Clear</button>
           </div>
         </div>
-
-        <div id="top" class="tab-pane" style="display:none;">
-           <h3 style="margin-top:0;border-bottom:none;">Top All Time</h3>
-           <div id="top-panel-content">
-              <p style="color:#999;text-align:center;padding:20px;">Hover over a row in the Statistics Table</p>
-           </div>
-        </div>
       </div>
-      
+      <div style="border:1px solid #eee;border-radius:.4rem">
+        <table id="tab">
+          <thead><tr>
+            <th data-sort="pilot">Pilot</th>
+            <th data-sort="corp">Corporation</th>
+            <th data-sort="alliance">Alliance</th>
+            <th data-sort="kills">Kills</th>
+            <th data-sort="losses">Losses</th>
+            <th data-sort="kd">K/D</th>
+            <th data-sort="solo">Solo%</th>
+            <th data-sort="danger">Danger</th>
+            <th data-sort="tz">TZ</th>
+          </tr></thead>
+          <tbody></ tbody>
+        </table>
+      </div>
     </div>
-    <div class="sidebar">
-      <details style="margin-top:8px"><summary>Debug Console</summary><pre id="dbg" style="white-space:pre-wrap;background:#fff;border:1px solid #eee;border-radius:.5rem;padding:8px;max-height:220px;overflow:auto"></pre></details><p style="color: green;">This site does not use cookies</p>
+  </div>
+  <div class="right">
+    <div id="top-panel-wrap">
+      <div id="top-panel-header">
+        <span class="title">Top All Time Kills In: Ships | Systems | Alliances (separately)</span>
+        <button id="collapse-btn" onclick="window.__toggleTop?window.__toggleTop():void(0)">◀</button>
+      </div>
+      <div id="topinfo-content">
+        <div id="topinfo" style="width:100%;min-height:160px;border:1px solid #eee;border-radius:.5rem;background:#fff;padding:12px;"></div>
+      </div>
+    </div>
+    <div style="margin-top:16px">
+      <h3>Interaction matrix — green = shared corporation/alliance; red = who is with who or against on last 50 kills and losses maills</h3>
+      <div class="legend" style="display:flex;gap:.5rem;align-items:center;font:12px/1.2 monospace;margin:.25rem 0 .5rem">
+        <span style="display:inline-block;width:14px;height:14px;background:#c8f7c8;border:1px solid #ccc"></span> shared corporation or alliance
+	<span style="display:inline-block;width:14px;height:14px;background:#ff0000;border:1px solid #ccc"></span> on last 50 killmails with
+      </div>
+      <div id="heat"></div>
+      <details style="margin-top:8px"><summary>Debug</summary><pre id="dbg" style="white-space:pre-wrap;background:#fff;border:1px solid #eee;border-radius:.5rem;padding:8px;max-height:220px;overflow:auto"></pre></details><p style="color: green;">This site does not use cookies</p>
       
       <div class="help-row">
           <a href="https://evecia.online/help/" class="help-link">HELP</a>
@@ -456,7 +759,6 @@ try {
   </div>
 </main>
 <script>(function(){
-  // Dynamic loading of app.js file
   var boot=document.getElementById('boot');
   var dbg=document.getElementById('dbg');
   function mark(t,c){ if(boot){ boot.textContent=t; if(c) boot.style.color=c; } }
@@ -469,21 +771,13 @@ try {
   };
   
   var s=document.createElement('script');
-  s.src=(window.APP_JS_PATH||'app.js')+'?v=39.3'; // Versioning for cache-busting
-  document.head.appendChild(s);
+  s.src=(window.APP_JS_PATH||'app.js')+'?v=v39.2'; // Zmieniono wersję dla pewności
+  
+  s.onload=function(){ 
+      mark((window.__APP_OK?'JS loaded':'JS loaded (no APP_OK)'),'#090'); 
+  };
+  s.onerror=function(){ mark('JS failed to load (network/404)','#c00'); };
+  (document.currentScript||document.body).parentNode.appendChild(s);
 })();</script>
-</body>
+<noscript><style>#boot{color:#c00!important}</style>Włącz JavaScript w przeglądarce.</noscript></body>
 </html>
-<?php
-  }
-} catch(Exception $e){
-  // Catch and format API exceptions as JSON errors.
-  if($action){
-    http_response_code(400);
-    echo json_encode(['error'=>$e->getMessage()]);
-  } else {
-    // Catch exceptions during the initial HTML rendering phase (rare).
-    echo '<html><body><h1>Error</h1><p>'.$e->getMessage().'</p></body></html>';
-  }
-}
-?>
