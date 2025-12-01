@@ -1,0 +1,1223 @@
+W porządku. Dokonałem szczegółowego tłumaczenia obu plików na język angielski. Dodałem również więcej opisów i komentarzy, aby spełnić Twoje wymaganie dotyczące szerszej dokumentacji technicznej, przy zachowaniu oryginalnej struktury i logiki kodu.
+
+### 1\. `index.php` (PHP Backend)
+
+```php
+<?php
+// UA (User Agent) constant definition. This is MANDATORY for EVE Online ESI API compliance and responsible data usage.
+define('UA', 'evecia/5.0 (+mailto:pawel.kalaska@gmail.com)'); 
+// Path to the local SQLite database file, used for persistent caching of pilot data and assets.
+define('DB', __DIR__.'/data.sqlite'); 
+
+// Database connection handler. Initializes connection and schema if needed.
+function db(){ static $d; 
+  if($d) return $d; 
+  
+  $d=new PDO('sqlite:'.DB); 
+  $d->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+  // Initialize database schema
+  $d->exec("PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS characters(
+  id INTEGER PRIMARY KEY, name TEXT, birthday TEXT,
+  corp_id INT, corp_name TEXT,
+  alliance_id INT, alliance_name TEXT,
+  updated_at TEXT);
+CREATE TABLE IF NOT EXISTS stats(
+  char_id INTEGER PRIMARY KEY, kills INT, losses INT, solo INT, group_kills INT, danger REAL, updated_at TEXT);
+CREATE TABLE IF NOT EXISTS top(
+  char_id INTEGER PRIMARY KEY,
+  ships_json TEXT,
+  systems_json TEXT,
+  alliances_json TEXT, 
+  updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS logos(
+    id INTEGER PRIMARY KEY,
+    type TEXT,       -- 'corp' or 'alli'
+    img_data BLOB,
+    updated_at TEXT
+);");
+  
+  // Attempt to add a new column for cheap database schema migration without dropping tables.
+  try{ $d->exec("ALTER TABLE top ADD COLUMN alliances_json TEXT"); } catch(PDOException $e){}
+  return $d;
+}
+
+// Universal HTTP request wrapper using cURL. Handles timeouts, custom headers, and POST data transmission.
+function http($url, $opts=[]){
+  $ch=curl_init($url);
+  curl_setopt($ch, CURLOPT_USERAGENT, UA);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+  curl_setopt($ch, CURLOPT_TIMEOUT, $opts['timeout']??10);
+  if(!empty($opts['headers'])) curl_setopt($ch, CURLOPT_HTTPHEADER, $opts['headers']);
+  if(!empty($opts['post'])) curl_setopt($ch, CURLOPT_POSTFIELDS, $opts['post']);
+  if(!empty($opts['post'])) curl_setopt($ch, CURLOPT_POST, 1);
+
+  $data=curl_exec($ch);
+  $http_code=curl_getinfo($ch, CURLINFO_HTTP_CODE);
+  $err=curl_error($ch);
+  curl_close($ch);
+
+  if($err) throw new Exception('cURL Error: '.$err);
+  if($http_code>=400) throw new Exception('HTTP Error '.$http_code.' for '.$url);
+  return $data;
+}
+
+// Wrapper function specifically for the EVE Swagger Interface (ESI) API. Handles JSON decoding.
+function esi($path, $opts=[]){
+  $url='https://esi.evetech.net/latest'.$path;
+  $data=http($url, $opts);
+  return json_decode($data, true);
+}
+
+// ------------------------------------------------------------------
+// API ACTIONS HANDLER
+// ------------------------------------------------------------------
+
+$action=$_GET['action']??'';
+try {
+  if($action){
+    // Set standard headers for JSON API responses from the backend.
+    header('Content-Type: application/json');
+    $post_data=json_decode(file_get_contents('php://input'), true);
+
+    switch($action){
+      case 'resolveBatch':
+        // Endpoint for batch resolution of pilot names to character IDs using ESI.
+        $names=$post_data['names']??[];
+        if(!$names) throw new Exception('Missing input data (names)');
+        $resolved=[];
+        
+        // Step 1: Attempt batch resolution using the most efficient ESI endpoint (/universe/ids/).
+        $ids_data=esi('/universe/ids/', ['post'=>json_encode($names), 'headers'=>['Content-Type: application/json']]);
+        $char_map=[];
+        if(!empty($ids_data['characters'])) foreach($ids_data['characters'] as $c) $char_map[strtolower($c['name'])]=$c['id'];
+        
+        // Step 2: For remaining unresolved names, try strict ESI search.
+        $remaining=[];
+        foreach($names as $n) if(!isset($char_map[strtolower($n)])) $remaining[]=$n;
+
+        if($remaining){
+            $search_data=esi('/search/', ['path'=>'?categories=character&search='.urlencode(implode(',', $remaining)).'&strict=true']);
+            if(!empty($search_data['character'])) {
+                // ESI search returns IDs, so we call ESI names endpoint to match IDs back to original names.
+                $info_data=esi('/characters/names/', ['post'=>json_encode($search_data['character']), 'headers'=>['Content-Type: application/json']]);
+                if($info_data) foreach($info_data as $c) $char_map[strtolower($c['name'])]=$c['character_id'];
+            }
+        }
+
+        // Step 3: For still unresolved names, try non-strict (fuzzy) ESI search as a last resort.
+        $remaining=[];
+        foreach($names as $n) if(!isset($char_map[strtolower($n)])) $remaining[]=$n;
+
+        if($remaining){
+            $search_data=esi('/search/', ['path'=>'?categories=character&search='.urlencode(implode(',', $remaining)).'&strict=false']);
+            if(!empty($search_data['character'])) {
+                // ESI search returns IDs, call ESI names endpoint to match IDs back to names.
+                $info_data=esi('/characters/names/', ['post'=>json_encode($search_data['character']), 'headers'=>['Content-Type: application/json']]);
+                if($info_data) foreach($info_data as $c) $char_map[strtolower($c['name'])]=$c['character_id'];
+            }
+        }
+        
+        // Final assembly of the resolved list, including null IDs for names that could not be found.
+        foreach($names as $n){
+            $resolved[]= [
+                'name'=>$n,
+                'id'=>$char_map[strtolower($n)]??null
+            ];
+        }
+
+        echo json_encode($resolved);
+        break;
+
+      case 'pilot':
+        // Endpoint for fetching and caching core character details (corporation, alliance, birthday) from ESI.
+        $id=$post_data['id']??0;
+        if(!$id) throw new Exception('Invalid character ID');
+        
+        $db=db();
+        // Check cache for pilot details. Data is considered valid if updated within the last 30 days.
+        $stmt=$db->prepare("SELECT * FROM characters WHERE id=? AND updated_at > datetime('now', '-30 day')");
+        $stmt->execute([$id]);
+        $data=$stmt->fetch(PDO::FETCH_ASSOC);
+
+        if(!$data){
+            // Fetch fresh data from ESI
+            $char_info=esi('/characters/'.$id.'/');
+            if(empty($char_info['name'])) throw new Exception('Character not found: '.$id);
+            
+            $corp_info=esi('/corporations/'.$char_info['corporation_id'].'/');
+            $alliance_info=null;
+            if(!empty($char_info['alliance_id'])) $alliance_info=esi('/alliances/'.$char_info['alliance_id'].'/');
+
+            $data=[
+                'id'=>$id,
+                'name'=>$char_info['name'],
+                'birthday'=>$char_info['birthday'],
+                'corp_id'=>$char_info['corporation_id'],
+                'corp_name'=>$corp_info['name'],
+                'alliance_id'=>$char_info['alliance_id']??null,
+                'alliance_name'=>$alliance_info['name']??null,
+            ];
+
+            // Save/Update the character and related corporation/alliance info in the cache.
+            $stmt=$db->prepare("REPLACE INTO characters (id, name, birthday, corp_id, corp_name, alliance_id, alliance_name, updated_at) 
+                                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))");
+            $stmt->execute([
+                $data['id'], $data['name'], $data['birthday'], 
+                $data['corp_id'], $data['corp_name'], 
+                $data['alliance_id'], $data['alliance_name'], 
+            ]);
+        }
+
+        echo json_encode($data);
+        break;
+      
+      case 'stats':
+        // Endpoint for fetching and caching character combat statistics from zKillboard.
+        $id=$post_data['id']??0;
+        if(!$id) throw new Exception('Invalid character ID for stats');
+        
+        $db=db();
+        // Combat stats are volatile and cached for only 7 days.
+        $stmt=$db->prepare("SELECT * FROM stats WHERE char_id=? AND updated_at > datetime('now', '-7 day')");
+        $stmt->execute([$id]);
+        $data=$stmt->fetch(PDO::FETCH_ASSOC);
+
+        if(!$data){
+            // Fetch fresh stats from zKillboard API
+            $zkb_url='https://zkillboard.com/api/stats/characterID/'.$id.'/';
+            $zkb_data=http($zkb_url);
+            $stats=json_decode($zkb_data, true);
+
+            if(!$stats || isset($stats['error'])) throw new Exception('zKillboard Error: '.($stats['error']??'Unknown'));
+
+            $db_data=[
+                'char_id'=>$id,
+                'kills'=>$stats['kills']??0,
+                'losses'=>$stats['losses']??0,
+                'solo'=>$stats['soloKills']??0,
+                'group_kills'=>$stats['groupKills']??0,
+                'danger'=>$stats['dangerRatio']??0,
+            ];
+
+            // Persist key metrics to the stats cache
+            $stmt=$db->prepare("REPLACE INTO stats (char_id, kills, losses, solo, group_kills, danger, updated_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))");
+            $stmt->execute(array_values($db_data));
+            
+            // Attach raw statistics data from zKillboard to the response for front-end analysis (charts, timezone detection).
+            $db_data['raw_zkb_stats']=$stats;
+            $data=$db_data;
+        } else {
+            // If cached, still fetch raw ZKB data for charts/TZ detection in the frontend, as this API call is quick and ensures freshness for dynamic elements.
+            $zkb_url='https://zkillboard.com/api/stats/characterID/'.$id.'/';
+            $zkb_data=http($zkb_url);
+            $stats=json_decode($zkb_data, true);
+            $data['raw_zkb_stats']=$stats;
+        }
+
+        echo json_encode($data);
+        break;
+
+      case 'top':
+        // Endpoint for fetching and caching Top All Time lists (Ships, Systems, Alliances).
+        $id=$post_data['id']??0;
+        if(!$id) throw new Exception('Invalid character ID for TOP lists');
+        
+        $db=db();
+        // Check the 'top' table cache. Top lists are relatively static and cached for 30 days.
+        $stmt=$db->prepare("SELECT ships_json, systems_json, alliances_json FROM top WHERE char_id=? AND updated_at > datetime('now', '-30 day')");
+        $stmt->execute([$id]);
+        $data=$stmt->fetch(PDO::FETCH_ASSOC);
+
+        if(!$data || empty($data['ships_json']) || empty($data['systems_json']) || empty($data['alliances_json'])){
+            // Fetch fresh Top All Time data from zKillboard API
+            $ships_url='https://zkillboard.com/api/topalltime/characterID/'.$id.'/limit/10/type/ship/';
+            $systems_url='https://zkillboard.com/api/topalltime/characterID/'.$id.'/limit/10/type/system/';
+            $alliances_url='https://zkillboard.com/api/topalltime/characterID/'.$id.'/limit/10/type/alliance/';
+            
+            $ships_data=json_decode(http($ships_url), true);
+            $systems_data=json_decode(http($systems_url), true);
+            $alliances_data=json_decode(http($alliances_url), true);
+
+            $data=[
+                'ships_json'=>json_encode($ships_data),
+                'systems_json'=>json_encode($systems_data),
+                'alliances_json'=>json_encode($alliances_data),
+            ];
+
+            // Persist data to the top cache
+            $stmt=$db->prepare("REPLACE INTO top (char_id, ships_json, systems_json, alliances_json, updated_at) 
+                                VALUES (?, ?, ?, ?, datetime('now'))");
+            $stmt->execute([$id, $data['ships_json'], $data['systems_json'], $data['alliances_json']]);
+        }
+
+        // Decode JSON objects for the final response payload
+        echo json_encode([
+            'ships'=>json_decode($data['ships_json'], true),
+            'systems'=>json_decode($data['systems_json'], true),
+            'alliances'=>json_decode($data['alliances_json'], true),
+        ]);
+        break;
+
+      case 'zkbByUrl':
+        // Proxy endpoint for direct zKillboard API access where custom headers are needed.
+        $url=$_GET['url']??'';
+        if(!$url) throw new Exception('Missing URL parameter');
+
+        // Required headers to ensure proper access to specific zKillboard API endpoints (e.g., killmail detail or lists).
+        $opts=['headers'=>[
+            'Referer: https://zkillboard.com/', 
+            'X-Requested-With: XMLHttpRequest'
+        ]];
+        
+        $data=http($url, $opts);
+        echo $data;
+        break;
+
+      case 'zkbSalt':
+        // Proxy endpoint used to retrieve zKillboard's dynamic 'salt' parameter for specific API requests.
+        $url=$_GET['url']??'';
+        if(!$url) throw new Exception('Missing URL parameter');
+
+        // Retrieve the dynamic 'salt' parameter from zKillboard's JavaScript file.
+        $salt=http('https://zkillboard.com/js/salt.js');
+        $salt=str_replace(['document.write("', '");'], '', trim($salt));
+
+        $data=http($url.$salt);
+        echo $data;
+        break;
+
+      case 'graph':
+        // Endpoint for fetching recent killmails to generate the Interaction Matrix (Heat Map).
+        $id=$post_data['id']??0;
+        if(!$id) throw new Exception('Invalid character ID for graph');
+
+        // The graph relies on the latest 100 killmails/losses for real-time interaction assessment, so no database caching is applied here.
+        $zkb_url='https://zkillboard.com/api/kills/characterID/'.$id.'/page/1/';
+        $data=http($zkb_url);
+        echo $data;
+        break;
+
+      case 'logo':
+        // Endpoint for fetching and serving corporation/alliance logos, utilizing a local 30-day cache.
+        $id=$_GET['id']??0;
+        $type=$_GET['type']??'';
+        $size=$_GET['size']??64;
+
+        if($type!='corp' && $type!='alli') throw new Exception('Invalid type for logo');
+        if(!$id) throw new Exception('Invalid ID for logo');
+
+        $db=db();
+        // Check local logo cache
+        $stmt=$db->prepare("SELECT img_data FROM logos WHERE id=? AND type=? AND updated_at > datetime('now', '-30 day')");
+        $stmt->execute([$id, $type]);
+        $img_data=$stmt->fetchColumn();
+
+        if(!$img_data){
+            // Fetch fresh logo from ESI
+            $path=($type=='corp'?'/corporations/':'/alliances/').$id.'/logo/';
+            try {
+                $img_data=http('https://images.evetech.net/'.$path.'?size='.$size, ['timeout'=>5]);
+            } catch(Exception $e){
+                // Fallback mechanism: if the ESI imageserver is down, return the most recent logo from the local cache instead of failing.
+                $stmt=$db->prepare("SELECT img_data FROM logos WHERE id=? AND type=?");
+                $stmt->execute([$id, $type]);
+                $img_data=$stmt->fetchColumn();
+                if(!$img_data) throw new Exception('ESI/DB Error: Failed to fetch/save logo');
+            }
+            
+            // Persist the newly fetched logo (binary BLOB data) to the cache.
+            if($img_data){
+                $stmt=$db->prepare("REPLACE INTO logos (id, type, img_data, updated_at) VALUES (?, ?, ?, datetime('now'))");
+                $stmt->execute([$id, $type, $img_data]);
+            }
+        }
+        
+        // Set image headers and 1-hour public cache for the browser.
+        header('Content-Type: image/png');
+        header('Cache-Control: public, max-age=3600'); 
+        echo $img_data;
+        exit;
+
+      default:
+        throw new Exception('Invalid action');
+    }
+
+  } else {
+    // ------------------------------------------------------------------
+    // FRONTEND HTML (Standard application entry point)
+    // ------------------------------------------------------------------
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>evecia - Pilot Analysis</title>
+  <style>
+    body{ font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; background-color:#f7f7fb; color:#111; margin:0; padding:0; }
+    main{ padding:20px; }
+    .container{ max-width:1200px; margin:0 auto; display:flex; gap:20px; }
+    .main-content{ flex:1; min-width:600px; }
+    .sidebar{ width:350px; background:#fff; padding:15px; border-radius:.5rem; box-shadow:0 4px 12px rgba(0,0,0,.1); height:fit-content; }
+    h1{ font-size:1.8em; color:#333; margin-top:0; border-bottom:1px solid #eee; padding-bottom:5px; }
+    .input-group{ margin-bottom:15px; }
+    textarea{ width:100%; height:150px; padding:10px; border:1px solid #ddd; border-radius:.5rem; box-sizing:border-box; font-family:monospace; font-size:.9em; }
+    button{ padding:10px 15px; border:none; border-radius:.5rem; cursor:pointer; font-weight:bold; }
+    #go{ background-color:#007bff; color:#fff; }
+    #go:disabled{ background-color:#ccc; cursor:not-allowed; }
+    .button-group{ display:flex; gap:10px; margin-top:10px; }
+    .button-group button{ flex:1; background-color:#f0f0f0; color:#333; }
+    .button-group button:hover{ background-color:#e0e0e0; }
+    #status{ margin-top:15px; font-weight:bold; color:#555; }
+    .main-table{ width:100%; border-collapse:collapse; margin-top:20px; background:#fff; border-radius:.5rem; overflow:hidden; box-shadow:0 4px 12px rgba(0,0,0,.05); }
+    .main-table th, .main-table td{ padding:10px; border-bottom:1px solid #eee; text-align:left; }
+    .main-table th{ background-color:#f5f5f5; cursor:pointer; }
+    .main-table th.sort-asc:after{ content:"▲"; margin-left:5px; }
+    .main-table th.sort-desc:after{ content:"▼"; margin-left:5px; }
+    .main-table tr:hover{ background-color:#fafafa; }
+    .main-table img{ vertical-align:middle; border-radius:3px; margin-right:5px; }
+    .matrix-container{ margin-top:20px; padding:15px; background:#fff; border-radius:.5rem; box-shadow:0 4px 12px rgba(0,0,0,.05); }
+    .matrix-table{ width:100%; border-collapse:collapse; table-layout:fixed; }
+    .matrix-table th, .matrix-table td{ padding:5px; border:1px solid #eee; text-align:center; font-size:.8em; overflow:hidden; }
+    .matrix-table th{ background-color:#f5f5f5; font-weight:normal; }
+    .matrix-table th:first-child{ width:15%; }
+    .matrix-cell{ width:100%; height:100%; display:block; }
+    #top-panel-wrap{ margin-top:20px; }
+    #top-panel-content{ background:#fff; padding:15px; border:1px solid #ddd; border-radius:.5rem; margin-top:10px; }
+    #top-panel-content ul{ list-style:none; padding:0; margin:0; }
+    #top-panel-content li{ padding:5px 0; border-bottom:1px solid #eee; }
+    #top-panel-content li:last-child{ border-bottom:none; }
+    .help-row{ text-align:right; margin-top:20px; }
+    .help-link{ color:#007bff; text-decoration:none; font-weight:bold; }
+  </style>
+</head>
+<body>
+<main>
+  <div class="container">
+    <div class="main-content">
+      <h1>evecia Analysis</h1>
+
+      <div class="input-group">
+        <textarea id="memo" placeholder="Enter a list of characters from Local chat (or paste Ctrl+V)"></textarea>
+        <div class="button-group">
+          <button id="go">Analyze</button>
+          <button id="save">Save As (Ctrl+S)</button>
+          <button id="qsave">Quick Save (Ctrl+Q)</button>
+          <button id="open">Open (Ctrl+O)</button>
+        </div>
+        <div id="status">Loading...</div>
+      </div>
+      
+      <div id="tabs">
+        <button onclick="showTab('tab')">Statistics Table</button>
+        <button onclick="showTab('heat')">Interaction Matrix</button>
+        <button onclick="showTab('top')">Top All Time</button>
+      </div>
+
+      <div id="tab-content">
+        <div id="tab" class="tab-pane">
+          <table class="main-table" id="table">
+            <thead>
+              <tr id="table-header"></tr>
+            </thead>
+            <tbody id="table-body">
+              <tr><td colspan="10" style="text-align:center;padding:50px;color:#999">Empty Table</td></tr>
+            </tbody>
+          </table>
+        </div>
+        
+        <div id="heat" class="tab-pane" style="display:none;">
+          <div class="matrix-container">
+            <h3 style="margin-top:0;border-bottom:none;">Interaction Matrix</h3>
+            <table class="matrix-table" id="matrix">
+              <tbody id="matrix-body">
+                <tr><td colspan="2" style="text-align:center;padding:50px;color:#999">Empty Table</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div id="top" class="tab-pane" style="display:none;">
+           <h3 style="margin-top:0;border-bottom:none;">Top All Time</h3>
+           <div id="top-panel-content">
+              <p style="color:#999;text-align:center;padding:20px;">Hover over a row in the Statistics Table</p>
+           </div>
+        </div>
+      </div>
+      
+    </div>
+    <div class="sidebar">
+      <details style="margin-top:8px"><summary>Debug Console</summary><pre id="dbg" style="white-space:pre-wrap;background:#fff;border:1px solid #eee;border-radius:.5rem;padding:8px;max-height:220px;overflow:auto"></pre></details><p style="color: green;">This site does not use cookies</p>
+      
+      <div class="help-row">
+          <a href="https://evecia.online/help/" class="help-link">HELP</a>
+          <div class="arrow-container"></div>
+      </div>
+      
+    </div>
+  </div>
+</main>
+<script>(function(){
+  // Dynamic loading of app.js file
+  var boot=document.getElementById('boot');
+  var dbg=document.getElementById('dbg');
+  function mark(t,c){ if(boot){ boot.textContent=t; if(c) boot.style.color=c; } }
+  function log(x){ if(dbg){ dbg.textContent=(dbg.textContent?dbg.textContent+'\n':'')+x; } }
+  
+  mark('Loading JS…','#555');
+  window.onerror=function(msg,src,line,col,err){
+    mark('JS error: '+String(msg).slice(0,140),'#c00');
+    log((err&&err.stack)||[String(msg),src,line,col].join(' '));
+  };
+  
+  var s=document.createElement('script');
+  s.src=(window.APP_JS_PATH||'app.js')+'?v=39.3'; // Versioning for cache-busting
+  document.head.appendChild(s);
+})();</script>
+</body>
+</html>
+<?php
+  }
+} catch(Exception $e){
+  // Catch and format API exceptions as JSON errors.
+  if($action){
+    http_response_code(400);
+    echo json_encode(['error'=>$e->getMessage()]);
+  } else {
+    // Catch exceptions during the initial HTML rendering phase (rare).
+    echo '<html><body><h1>Error</h1><p>'.$e->getMessage().'</p></body></html>';
+  }
+}
+?>
+```
+
+### 2\. `app.js` (JavaScript Frontend)
+
+```javascript
+// app.js — FIXED: Scope and Reference Errors (v39.3)
+window.__APP_OK = 1;
+(function(){
+  // UI references (DOM elements) defined at the top to ensure variables are available globally within the IIFE.
+  var st = document.getElementById('st');
+  var memo = document.getElementById('memo');
+  var collapseBtn = document.getElementById('collapse-btn'); // Currently unused, placeholder for future feature
+  var topPanelWrap = document.getElementById('top-panel-wrap'); // Currently unused, placeholder for future feature
+  
+  // APPLICATION STATE: Contains all necessary data for rendering and session management.
+  var state = { 
+    rows: [], // Array of pilot data objects
+    sortKey: 'alliance', // Default sort key for the main pilot table.
+    sortDir: 'asc', // Default sort direction
+    isTopPanelCollapsed: false,
+    memoText: '', // Last input text from the textarea
+    lastSave: null // Timestamp of the last quick save
+  };
+  var graph = null; // Stores the calculated interaction matrix
+  var topCache={}; // Cache for Top All Time data (per character)
+  var busy = false; // Flag to prevent multiple simultaneous analysis runs
+  var killMem = { byPilot: {}, byKill: {} }; // Killmail memory structures for building the Interaction Matrix (Heat Map).
+
+  // Boot success indicator in the UI for debugging purposes.
+  try {
+    var boot = document.getElementById('status');
+    if (boot) { boot.textContent = 'JS loaded'; boot.style.color = '#090'; }
+  } catch(_e){}
+
+  function debug(msg){
+    // Logs messages to the #dbg preformatted tag in the sidebar.
+    var pre = document.getElementById('dbg');
+    if(!pre) return;
+    try { pre.textContent += (typeof msg==='string'? msg : JSON.stringify(msg, null, 2)) + "\n"; }
+    catch(e){ pre.textContent += '[Error logging object]'; }
+    pre.scrollTop = pre.scrollHeight; // Automatically scrolls the debug console to show the newest messages.
+  }
+  window.__dbg=debug;
+
+  function mark(t,c){
+    // Updates the status indicator (#status element).
+    var boot=document.getElementById('status');
+    if(boot){ boot.textContent=t; if(c) boot.style.color=c; } 
+  }
+
+  function getUrl(action, params){
+    // Constructs the URL for API calls to index.php.
+    var url = 'index.php?action='+action;
+    for(var key in params) url += '&' + key + '=' + encodeURIComponent(params[key]);
+    return url;
+  }
+
+  function api(action, payload, opts={}){
+    // Universal API wrapper handling AJAX requests, JSON parsing, and error reporting.
+    return new Promise(function(resolve, reject){
+      debug('API call: '+action);
+      var url=getUrl(action);
+      var xhr=new XMLHttpRequest();
+      xhr.open('POST', url, true);
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      xhr.onload=function(){
+        if(xhr.status>=200 && xhr.status<300){
+          try {
+            var data=JSON.parse(xhr.responseText);
+            resolve(data);
+          } catch(e){
+            // Allows API calls to return raw text instead of attempting JSON parsing (useful for proxies like zkbByUrl).
+            if(opts.raw) resolve(xhr.responseText);
+            else reject('Processing JSON Error: '+e.message);
+          }
+        } else {
+          var err=xhr.responseText;
+          try { err=JSON.parse(err).error; } catch(e){}
+          reject(err || 'HTTP Error: '+xhr.status);
+        }
+      };
+      xhr.onerror=function(){ reject('Network Error'); };
+      xhr.send(JSON.stringify(payload));
+    });
+  }
+
+  function renderHeader(){
+    // Renders the header row for the main statistics table and sets up sorting handlers.
+    var header=document.getElementById('table-header');
+    if(!header) return;
+
+    // Defines the structure and behavior of the main statistics table columns.
+    var columns=[
+      {key:'name', label:'Name', sort:'asc'}, 
+      {key:'birthday', label:'Birthday', sort:'asc'}, 
+      {key:'corpName', label:'Corporation', sort:'asc'}, 
+      {key:'allianceName', label:'Alliance', sort:'asc'},
+      {key:'kills', label:'Kills', sort:'desc'},
+      {key:'losses', label:'Losses', sort:'desc'},
+      {key:'kd', label:'K/D', sort:'desc'},
+      {key:'solo', label:'Solo %', sort:'desc'},
+      {key:'danger', label:'Danger %', sort:'desc'},
+      {key:'groupKills', label:'Group Kills', sort:'desc'},
+      {key:'tz', label:'TZ', sort:'asc'},
+    ];
+    
+    header.innerHTML='';
+    columns.forEach(function(col){
+      var th=document.createElement('th');
+      th.textContent=col.label;
+      th.dataset.key=col.key;
+      th.dataset.defaultSort=col.sort;
+      th.onclick=function(){ setSort(col.key); };
+      
+      // Apply active sorting indicator classes to the table header.
+      if(col.key===state.sortKey){
+        th.classList.add(state.sortDir==='asc'?'sort-asc':'sort-desc');
+      }
+      header.appendChild(th);
+    });
+  }
+
+  function setSort(key){
+    // Updates the sorting parameters (key and direction).
+    debug('Sorting by: '+key);
+    var newDir = 'asc';
+    if (state.sortKey === key) {
+        newDir = state.sortDir === 'asc' ? 'desc' : 'asc';
+    } else {
+        // Set default direction for a new column based on its definition.
+        var header = document.querySelector('[data-key="'+key+'"]');
+        if (header) {
+            newDir = header.dataset.defaultSort || 'asc';
+        }
+    }
+    state.sortKey = key;
+    state.sortDir = newDir;
+    renderLeft();
+  }
+
+  function renderLeft(){
+    // Renders the main pilot statistics table body based on the current state and sorting.
+    var body=document.getElementById('table-body');
+    if(!body) return;
+
+    // Sorting logic
+    var sortedRows=state.rows.slice().sort(function(a,b){
+      var key=state.sortKey;
+      var dir=state.sortDir==='asc'?1:-1;
+      
+      var valA=a[key];
+      var valB=b[key];
+
+      // Handle numbers
+      if(['kills','losses','groupKills','kd','solo','danger'].includes(key)){
+        valA=parseFloat(valA) || 0;
+        valB=parseFloat(valB) || 0;
+        if(valA!==valB) return (valA>valB?1:-1)*dir;
+        
+        // Secondary sort for numbers: alliance -> corp -> name to ensure consistent grouping when primary values are equal.
+        if(a.allianceName!==b.allianceName) return (a.allianceName>b.allianceName?1:-1)*dir;
+        if(a.corpName!==b.corpName) return (a.corpName>b.corpName?1:-1)*dir;
+        return (a.name>b.name?1:-1)*dir;
+      }
+      
+      // Handle strings
+      if(valA===valB) return 0;
+      return (valA>valB?1:-1)*dir;
+    });
+
+    body.innerHTML='';
+
+    if(sortedRows.length===0){
+        body.innerHTML = '<tr><td colspan="11" style="text-align:center;padding:50px;color:#999">Empty Table</td></tr>';
+        return;
+    }
+
+    // Generating data row
+    sortedRows.forEach(function(row){
+      var tr=document.createElement('tr');
+      tr.dataset.id=row.id;
+      tr.dataset.name=row.name;
+      // Event handler to load/display Top All Time data on hover
+      tr.onmouseenter=function(){ renderTop(row.id); };
+      
+      // Use non-breaking space for names to prevent line breaks in affiliations columns
+      var allianceText=row.allianceName?row.allianceName.replace(/ /g,'\u00A0'):'';
+      var corpText=row.corpName?row.corpName.replace(/ /g,'\u00A0'):'';
+
+      tr.innerHTML=[
+        '<td>'+row.name+'</td>',
+        '<td>'+(row.birthday||'').slice(0,10)+'</td>',
+        '<td><img src="'+getUrl('logo', {id:row.corpId, type:'corp'})+'" width="24" height="24"> '+corpText+'</td>',
+        '<td>'+(row.allianceId?'<img src="'+getUrl('logo', {id:row.allianceId, type:'alli'})+'" width="24" height="24"> ':'') + allianceText+'</td>',
+        '<td>'+(row.kills!==null?row.kills.toLocaleString():'')+'</td>',
+        '<td>'+(row.losses!==null?row.losses.toLocaleString():'')+'</td>',
+        '<td>'+(row.kd!==null?row.kd.toFixed(2):'')+'</td>',
+        '<td>'+(row.solo!==null?(row.solo*100).toFixed(1)+'%': '')+'</td>',
+        '<td>'+(row.danger!==null?(row.danger*100).toFixed(1)+'%': '')+'</td>',
+        '<td>'+(row.groupKills!==null?row.groupKills.toLocaleString():'')+'</td>',
+        '<td>'+(row.tz||'')+'</td>',
+      ].join('');
+      body.appendChild(tr);
+    });
+
+    // Update column headers for sorting indicator
+    document.querySelectorAll('#table-header th').forEach(function(th){
+      th.classList.remove('sort-asc', 'sort-desc');
+      if(th.dataset.key===state.sortKey){
+        th.classList.add(state.sortDir==='asc'?'sort-asc':'sort-desc');
+      }
+    });
+
+    renderHeat();
+  }
+
+  function saveState(){
+    // Saves the entire application state (excluding heavy cache objects like graph/topCache) to local storage.
+    try {
+      localStorage.setItem('evecia_state', JSON.stringify(state));
+      state.lastSave = new Date().toLocaleString();
+      document.getElementById('qsave').title = 'Quick Save: '+state.lastSave;
+      mark('Saved to Quick Save','#090');
+    } catch(e){
+      debug('Error saving to Quick Save: '+e.message);
+      mark('Error saving to Quick Save: '+e.message, '#c00');
+    }
+  }
+
+  function loadState(json){
+    // Loads and restores application state from a JSON string (either from file or local storage).
+    try {
+      var savedState=JSON.parse(json);
+      // Merging prevents errors if the loaded state is missing newer keys defined in the current application version.
+      for(var key in state) {
+          if (savedState.hasOwnProperty(key)) {
+              state[key] = savedState[key];
+          }
+      }
+      
+      memo.value=state.memoText;
+      
+      // Update quick save button title
+      if(state.lastSave) document.getElementById('qsave').title = 'Quick Save: '+state.lastSave;
+      
+      mark('State restored from Quick Save', '#090');
+      
+      // Re-render
+      renderHeader();
+      renderLeft();
+    } catch(e){
+      debug('Error loading state: '+e.message);
+      mark('Error loading state: '+e.message, '#c00');
+    }
+  }
+
+  function quickLoad(){
+      // Attempts to load the state from local storage.
+      var saved=localStorage.getItem('evecia_state');
+      if(saved){
+          loadState(saved);
+      } else {
+          mark('No Quick Save Found', '#f90');
+      }
+  }
+
+  function saveAsFile(){
+      // Serializes the current state and downloads it as a JSON file (Save As).
+      var json=JSON.stringify(state, null, 2);
+      var blob=new Blob([json], {type:'application/json'});
+      var url=URL.createObjectURL(blob);
+      var a=document.createElement('a');
+      a.href=url;
+      a.download='evecia_state_'+(new Date()).toISOString().slice(0,10)+'.json';
+      a.click();
+      URL.revokeObjectURL(url);
+      mark('Saved to file: '+a.download, '#090');
+  }
+
+  function openFile(isQuickLoad){
+      // Handles both quick load from storage and file dialog load.
+      if(isQuickLoad){
+          quickLoad();
+          return;
+      }
+      
+      // File dialogue initiation
+      var input=document.createElement('input');
+      input.type='file';
+      input.accept='.json';
+      input.onchange=function(e){
+          var file=e.target.files[0];
+          if(!file) { mark('Cancelled', '#555'); return; }
+          if(!file.name.endsWith('.json')) { mark('Invalid file type', '#c00'); return; }
+
+          mark('Opening file...', '#555');
+          var reader=new FileReader();
+          reader.onload=function(e){
+              try {
+                  var json=e.target.result;
+                  loadState(json);
+                  mark('State loaded from file', '#090');
+              } catch(e){
+                  mark('File read error: '+e.message, '#c00');
+              }
+          };
+          reader.readAsText(file);
+      };
+      input.click();
+  }
+
+  async function onAnalyze(){
+    // Main analysis orchestration function.
+    if(busy) return;
+    busy=true;
+    var goButton=document.getElementById('go');
+    goButton.disabled=true;
+    graph=null;
+    killMem = { byPilot: {}, byKill: {} };
+    topCache={};
+
+    try {
+      mark('Starting Analysis...','#007bff');
+      state.memoText=memo.value.trim();
+      var names=state.memoText.split('\n').map(function(n){ return n.trim(); }).filter(function(n){ return n.length>0; });
+      state.rows=[];
+
+      if(names.length===0){
+        mark('Analysis finished (No names)', '#090');
+        renderLeft();
+        return;
+      }
+
+      // 1. Resolve names to IDs
+      mark('Resolving pilots to IDs...', '#007bff');
+      var resolved=await api('resolveBatch', {names:names});
+      var validPilots=resolved.filter(function(p){ return p.id; });
+      
+      if(validPilots.length===0) throw new Error('Could not resolve any valid characters from the list.');
+
+      // 2. Fetch details (pilot) and stats (zkb) for each
+      for(var i=0; i<validPilots.length; i++){
+        var p=validPilots[i];
+        mark('Fetching pilot details '+(i+1)+'/'+validPilots.length+' ('+p.name+')', '#007bff');
+        
+        var pilotData=await api('pilot', {id:p.id});
+        mark('Fetching combat stats '+(i+1)+'/'+validPilots.length+' ('+p.name+')', '#007bff');
+        var statsData=await api('stats', {id:p.id});
+        
+        var row={
+          id: p.id,
+          name: pilotData.name,
+          birthday: pilotData.birthday,
+          corpId: pilotData.corp_id,
+          corpName: pilotData.corp_name,
+          allianceId: pilotData.alliance_id,
+          allianceName: pilotData.alliance_name,
+          kills: statsData.kills,
+          losses: statsData.losses,
+          kd: statsData.losses>0?statsData.kills/statsData.losses:statsData.kills,
+          solo: statsData.solo/statsData.kills || 0, // Solo Kill Ratio
+          danger: statsData.danger,
+          groupKills: statsData.group_kills,
+          tz: analyzeTimezone(statsData.raw_zkb_stats), // Timezone based on zKB activity
+          // Affiliation cache for graph rendering
+          _affiliations: [pilotData.corp_id, pilotData.alliance_id].filter(Boolean),
+        };
+        state.rows.push(row);
+      }
+      
+      // 3. Generate graph
+      mark('Calculating Interaction Matrix...', '#007bff');
+      graph = await getInteractionGraph(validPilots);
+
+      // 4. Fetch Top All Time for the first pilot (to warm up cache/display)
+      if(state.rows.length>0){
+        mark('Pre-fetching TOP lists...', '#007bff');
+        await fetchTopAllTime(state.rows[0].id);
+      }
+      
+      mark('Analysis finished successfully.', '#090');
+      renderLeft();
+    } catch(e){
+      mark('Analysis Error: '+e.message, '#c00');
+      debug('Analysis error: '+e.message);
+      state.rows=[]; // Clear rows on error
+      renderLeft();
+    } finally {
+      busy=false;
+      goButton.disabled=false;
+      saveState(); // Auto save state after completion (success or fail)
+    }
+  }
+
+  function analyzeTimezone(statsData){
+    // Extracts the estimated timezone label from raw zKillboard statistics data.
+    if(!statsData || !statsData.labels) return '';
+    
+    // Searching in stats for 'tz:' label (zKB data)
+    var tzLabel=statsData.labels.find(function(l){ return l.startsWith('tz:'); });
+    if(tzLabel){
+        var tzMap={
+            'tz:au':'AU', 'tz:eu':'EU', 'tz:us':'US', 
+            'tz:eu/us':'EU/US', 'tz:us/au':'US/AU', 'tz:eu/au':'EU/AU'
+        };
+        return tzMap[tzLabel] || '';
+    }
+    return '';
+  }
+
+  async function fetchTopAllTime(id){
+    // Fetches Top All Time lists from the API, prioritizing the internal JS cache.
+    if(topCache[id]) return topCache[id];
+    
+    try {
+        var data=await api('top', {id:id});
+        topCache[id]=data;
+        return data;
+    } catch(e){
+        debug('TOP lists fetching failure: '+e.message);
+        return {ships:[], systems:[], alliances:[]};
+    }
+  }
+
+  function renderTop(id){
+    // Displays the Top All Time panel content for the hovered pilot ID.
+    var content=document.getElementById('top-panel-content');
+    if(!content) return;
+
+    if(topCache[id]){
+        displayTopPanel(topCache[id]);
+    } else {
+        // Show loading indicator and fetch data if not cached
+        content.innerHTML='<p style="color:#007bff;text-align:center;padding:20px;">Loading Top All Time...</p>';
+        fetchTopAllTime(id).then(function(data){
+            // Only update if the user is still hovering over the row
+            if(document.querySelector('#table-body tr[data-id="'+id+'"]:hover')) {
+                displayTopPanel(data);
+            }
+        }).catch(function(e){
+            content.innerHTML='<p style="color:#c00;text-align:center;padding:20px;">Error loading Top All Time.</p>';
+        });
+    }
+  }
+
+  function displayTopPanel(data){
+    // Helper function to format and inject the Top All Time data into the sidebar HTML.
+    var content=document.getElementById('top-panel-content');
+    if(!content) return;
+    
+    var html='<h3>Top Ships (Kills)</h3>';
+    if(data.ships && data.ships.length>0){
+        html+='<ul>';
+        data.ships.forEach(function(item){ html+='<li>'+(item.shipName||'Unknown')+' ('+item.count+')</li>'; });
+        html+='</ul>';
+    } else { html+='<p style="color:#999;">Top Ships not found</p>'; }
+
+    html+='<h3>Top Systems (Kills In)</h3>';
+    if(data.systems && data.systems.length>0){
+        html+='<ul>';
+        data.systems.forEach(function(item){ html+='<li>'+(item.systemName||'Unknown')+' ('+item.count+')</li>'; });
+        html+='</ul>';
+    } else { html+='<p style="color:#999;">Top Systems not found</p>'; }
+
+    html+='<h3>Top Alliances (Kills Against)</h3>';
+    if(data.alliances && data.alliances.length>0){
+        html+='<ul>';
+        data.alliances.forEach(function(item){ html+='<li>'+(item.allianceName||'Unknown')+' ('+item.count+')</li>'; });
+        html+='</ul>';
+    } else { html+='<p style="color:#999;">Top Alliances not found</p>'; }
+
+    content.innerHTML=html;
+  }
+
+  async function getInteractionGraph(pilots){
+    // Fetches the last 100 killmails for all selected pilots and calculates the shared kill count (interaction strength).
+    var allKills=[];
+    // Killmail memory structures for building the Interaction Matrix
+    var killMem = { byPilot: {}, byKill: {} }; 
+    
+    for(var i=0; i<pilots.length; i++){
+        var p=pilots[i];
+        
+        // Use zKillboard API proxy to manage headers/salt
+        var zkbUrl=getUrl('zkbByUrl', {url:'https://zkillboard.com/api/kills/characterID/'+p.id+'/page/1/'});
+        var killsJson=await api(zkbUrl, {}, {raw:true});
+        var kills=JSON.parse(killsJson);
+        
+        if(!kills || kills.length===0) continue;
+        
+        // Store the list of the last 100 killmails/lossmails fetched for this pilot.
+        killMem.byPilot[p.id]=kills;
+        
+        kills.forEach(function(kill){
+            var killID=kill.killmail_id;
+            
+            // Record killmail ID for each pilot involved
+            if(!killMem.byKill[killID]) killMem.byKill[killID] = { attackers: [], victims: [] };
+            
+            // Determine if the current pilot was the victim or an attacker in this killmail
+            if(kill.victim.character_id===p.id){
+                killMem.byKill[killID].victims.push(p.id);
+            } else {
+                killMem.byKill[killID].attackers.push(p.id);
+            }
+
+            // Also track other pilots on the current list who were attackers/victims in this killmail
+            var participantIDs=new Set();
+            participantIDs.add(kill.victim.character_id);
+            kill.attackers.forEach(function(a){ participantIDs.add(a.character_id); });
+            
+            state.rows.forEach(function(row){
+                if(row.id!==p.id && participantIDs.has(row.id)){
+                    // Record that row.id was involved in a kill with p.id
+                    if(!killMem.byPilot[row.id]) killMem.byPilot[row.id]=[];
+                    killMem.byPilot[row.id].push(kill);
+                }
+            });
+        });
+    }
+
+    // Graph generation: Core matrix calculation logic - counting shared involvement in the last 100 kills/losses between every pair of listed pilots.
+    var matrix={};
+    var validIds=pilots.map(function(p){ return p.id; });
+    
+    for(var i=0; i<validIds.length; i++){
+        var idA=validIds[i];
+        for(var j=0; j<validIds.length; j++){
+            var idB=validIds[j];
+            if(idA===idB) continue;
+            
+            if(!matrix[idA]) matrix[idA]={};
+            
+            // Count shared killmails
+            var sharedCount=0;
+            if(killMem.byPilot[idA]){
+                killMem.byPilot[idA].forEach(function(kill){
+                    var killID=kill.killmail_id;
+                    // Check if pilot B was involved in this specific killmail
+                    var involvedB=false;
+                    if(kill.victim.character_id===idB) involvedB=true;
+                    kill.attackers.forEach(function(a){ if(a.character_id===idB) involvedB=true; });
+                    
+                    if(involvedB) sharedCount++;
+                });
+            }
+            matrix[idA][idB]=sharedCount;
+        }
+    }
+    
+    return matrix;
+  }
+
+  function renderHeat(){
+    // Renders the Interaction Matrix (Heat Map) based on the calculated graph and affiliations.
+    var matrixTable=document.getElementById('matrix-body');
+    if(!matrixTable) return;
+
+    matrixTable.innerHTML='';
+    if(!graph || state.rows.length===0){
+        matrixTable.innerHTML='<tr><td colspan="'+(state.rows.length+1)+'" style="text-align:center;padding:50px;color:#999;">No interaction data available (zKB)</td></tr>';
+        return;
+    }
+
+    var pilots=state.rows;
+    var validIds=pilots.map(function(p){ return p.id; });
+
+    // Header row
+    var headerRow=document.createElement('tr');
+    headerRow.innerHTML='<th></th>'+pilots.map(function(p){ return '<th>'+p.name+'</th>'; }).join('');
+    matrixTable.appendChild(headerRow);
+    
+    // Data rows
+    pilots.forEach(function(rowA){
+        var tr=document.createElement('tr');
+        tr.innerHTML='<th>'+rowA.name+'</th>'; // First column header (Row Label)
+        
+        pilots.forEach(function(rowB){
+            var td=document.createElement('td');
+            
+            if(rowA.id===rowB.id){
+                // Diagonal cells (pilot vs self)
+                td.style.backgroundColor='#ccc';
+                td.textContent='';
+            } else {
+                // 1. Check Affiliation (Green: Cooperation/Friendship)
+                var hasSharedAffiliation=false;
+                if(rowA._affiliations && rowB._affiliations){
+                    rowA._affiliations.forEach(function(affA){
+                        rowB._affiliations.forEach(function(affB){
+                            if(affA===affB) hasSharedAffiliation=true;
+                        });
+                    });
+                }
+                
+                // 2. Check Shared Actions (Red: Recent Shared Kills/Losses)
+                var sharedKills=graph[rowA.id]?.[rowB.id] || 0;
+                
+                var cellColor='';
+                var cellText='';
+                
+                if(hasSharedAffiliation){
+                    // Base green color, intensified slightly by recent shared kills
+                    var greenIntensity=Math.min(150, 50+sharedKills*10); 
+                    cellColor='rgb(0, '+greenIntensity+', 0)';
+                    cellText='C'; // C for Cooperation
+                }
+                
+                if(sharedKills>0){
+                    // Red color based on shared kills, overriding cooperation if kills are high
+                    var redIntensity=Math.min(150, 50+sharedKills*10); 
+                    cellColor='rgb('+redIntensity+', 0, 0)';
+                    cellText='A: '+sharedKills; // A for Actions/Aggression
+                }
+                
+                if(cellColor){
+                    td.style.backgroundColor=cellColor;
+                    td.style.color='#fff';
+                    td.textContent=cellText;
+                }
+            }
+            tr.appendChild(td);
+        });
+        matrixTable.appendChild(tr);
+    });
+  }
+  
+  // --- UI Handlers ---
+  function initHandlers(){
+    // Attaches all main button event handlers.
+    document.getElementById('go').onclick=onAnalyze;
+    document.getElementById('save').onclick=saveAsFile;
+    document.getElementById('qsave').onclick=saveState;
+    document.getElementById('open').onclick=function(e){
+        // Logic to determine if the user intends a Quick Load (default) or a File Dialog load (e.g., Ctrl-click).
+        var isQuickLoad = !e.ctrlKey && !e.shiftKey && !e.metaKey; 
+        openFile(isQuickLoad);
+    };
+
+    // Load memo text from state if available
+    var savedState = localStorage.getItem('evecia_state');
+    if (savedState) {
+        try {
+            var stateObj = JSON.parse(savedState);
+            memo.value = stateObj.memoText || '';
+            state.lastSave = stateObj.lastSave || null;
+            if(state.lastSave) document.getElementById('qsave').title = 'Quick Save: '+state.lastSave;
+        } catch(e) { debug('Error reading memo from state on init: '+e.message); }
+    }
+    
+    // Default tab settings
+    document.querySelectorAll('.tab-pane').forEach(function(p){ p.style.display='none'; });
+    var defaultTab=document.getElementById('tab');
+    if(defaultTab) defaultTab.style.display='block';
+
+    renderHeader();
+  }
+  
+  function showTab(tabId){
+    // Tab switching logic.
+    document.querySelectorAll('.tab-pane').forEach(function(p){ p.style.display='none'; });
+    var tab=document.getElementById(tabId);
+    if(tab) tab.style.display='block';
+  }
+  window.showTab=showTab; // Expose to global scope for HTML onclick attributes
+
+  // ---- KEYBOARD SHORTCUTS ----
+  document.addEventListener('keydown', function (event) {
+      var ctrlOrCmd = event.ctrlKey || event.metaKey;
+      
+      if (ctrlOrCmd) {
+          switch (event.key) {
+              case 's': // Ctrl/Cmd+S: Save As
+                  event.preventDefault();
+                  saveAsFile();
+                  break;
+              case 'q': // Ctrl/Cmd+Q: Quick Save
+                  event.preventDefault();
+                  saveState();
+                  break;
+              case 'o': // Ctrl/Cmd+O: Open/Quick Load
+                  event.preventDefault();
+                  var openButton = document.getElementById('open');
+                  // Forcing file behaviour: trigger synthetic event with CtrlKey set to make the openFile handler choose the file dialog.
+                  if (openButton) {
+                      var syntheticEvent = new MouseEvent('click', {
+                          bubbles: true,
+                          cancelable: true,
+                          ctrlKey: true 
+                      });
+                      openButton.dispatchEvent(syntheticEvent);
+                  }
+                  break;
+          }
+      }
+      
+      // Ctrl+Enter / Cmd+Enter: Analyze
+      if (ctrlOrCmd && event.key === 'Enter') {
+          event.preventDefault();
+          var goButton = document.getElementById('go');
+          if (goButton && !goButton.disabled) goButton.click();
+      }
+  }, true);
+  // ---- END OF SHORTCUTS ----
+
+
+  // ---- Global Ctrl+V: paste to #memo and run analysis ---
+  document.addEventListener('paste', function (event) {
+    // Global event listener to capture Ctrl+V (or Cmd+V), populate the input field, and trigger analysis automatically.
+    try {
+      var memo = document.getElementById('memo');
+      if (!memo) return;
+      var cd = event.clipboardData || window.clipboardData;
+      var text = cd ? cd.getData('text') : '';
+      if (!text) return;
+      event.preventDefault(); // Prevent default paste into memo
+      memo.value = text;
+      var btn = document.getElementById('go') || document.getElementById('analyze');
+      if (btn && typeof btn.onclick === 'function') btn.onclick();
+    } catch(e) {
+      console.error('Paste handler error:', e);
+    }
+  });
+  
+  // ---- Initialization ----
+  initHandlers();
+
+})(); // IIFE end
+```
