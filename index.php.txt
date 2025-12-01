@@ -1,0 +1,489 @@
+<?php
+// UA (User Agent) constant definition. This is MANDATORY for EVE Online ESI API compliance and responsible data usage.
+define('UA', 'evecia/5.0 (+mailto:pawel.kalaska@gmail.com)'); 
+// Path to the local SQLite database file, used for persistent caching of pilot data and assets.
+define('DB', __DIR__.'/data.sqlite'); 
+
+// Database connection handler. Initializes connection and schema if needed.
+function db(){ static $d; 
+  if($d) return $d; 
+  
+  $d=new PDO('sqlite:'.DB); 
+  $d->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+  // Initialize database schema
+  $d->exec("PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS characters(
+  id INTEGER PRIMARY KEY, name TEXT, birthday TEXT,
+  corp_id INT, corp_name TEXT,
+  alliance_id INT, alliance_name TEXT,
+  updated_at TEXT);
+CREATE TABLE IF NOT EXISTS stats(
+  char_id INTEGER PRIMARY KEY, kills INT, losses INT, solo INT, group_kills INT, danger REAL, updated_at TEXT);
+CREATE TABLE IF NOT EXISTS top(
+  char_id INTEGER PRIMARY KEY,
+  ships_json TEXT,
+  systems_json TEXT,
+  alliances_json TEXT, 
+  updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS logos(
+    id INTEGER PRIMARY KEY,
+    type TEXT,       -- 'corp' or 'alli'
+    img_data BLOB,
+    updated_at TEXT
+);");
+  
+  // Attempt to add a new column for cheap database schema migration without dropping tables.
+  try{ $d->exec("ALTER TABLE top ADD COLUMN alliances_json TEXT"); } catch(PDOException $e){}
+  return $d;
+}
+
+// Universal HTTP request wrapper using cURL. Handles timeouts, custom headers, and POST data transmission.
+function http($url, $opts=[]){
+  $ch=curl_init($url);
+  curl_setopt($ch, CURLOPT_USERAGENT, UA);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+  curl_setopt($ch, CURLOPT_TIMEOUT, $opts['timeout']??10);
+  if(!empty($opts['headers'])) curl_setopt($ch, CURLOPT_HTTPHEADER, $opts['headers']);
+  if(!empty($opts['post'])) curl_setopt($ch, CURLOPT_POSTFIELDS, $opts['post']);
+  if(!empty($opts['post'])) curl_setopt($ch, CURLOPT_POST, 1);
+
+  $data=curl_exec($ch);
+  $http_code=curl_getinfo($ch, CURLINFO_HTTP_CODE);
+  $err=curl_error($ch);
+  curl_close($ch);
+
+  if($err) throw new Exception('cURL Error: '.$err);
+  if($http_code>=400) throw new Exception('HTTP Error '.$http_code.' for '.$url);
+  return $data;
+}
+
+// Wrapper function specifically for the EVE Swagger Interface (ESI) API. Handles JSON decoding.
+function esi($path, $opts=[]){
+  $url='https://esi.evetech.net/latest'.$path;
+  $data=http($url, $opts);
+  return json_decode($data, true);
+}
+
+// ------------------------------------------------------------------
+// API ACTIONS HANDLER
+// ------------------------------------------------------------------
+
+$action=$_GET['action']??'';
+try {
+  if($action){
+    // Set standard headers for JSON API responses from the backend.
+    header('Content-Type: application/json');
+    $post_data=json_decode(file_get_contents('php://input'), true);
+
+    switch($action){
+      case 'resolveBatch':
+        // Endpoint for batch resolution of pilot names to character IDs using ESI.
+        $names=$post_data['names']??[];
+        if(!$names) throw new Exception('Missing input data (names)');
+        $resolved=[];
+        
+        // Step 1: Attempt batch resolution using the most efficient ESI endpoint (/universe/ids/).
+        $ids_data=esi('/universe/ids/', ['post'=>json_encode($names), 'headers'=>['Content-Type: application/json']]);
+        $char_map=[];
+        if(!empty($ids_data['characters'])) foreach($ids_data['characters'] as $c) $char_map[strtolower($c['name'])]=$c['id'];
+        
+        // Step 2: For remaining unresolved names, try strict ESI search.
+        $remaining=[];
+        foreach($names as $n) if(!isset($char_map[strtolower($n)])) $remaining[]=$n;
+
+        if($remaining){
+            $search_data=esi('/search/', ['path'=>'?categories=character&search='.urlencode(implode(',', $remaining)).'&strict=true']);
+            if(!empty($search_data['character'])) {
+                // ESI search returns IDs, so we call ESI names endpoint to match IDs back to original names.
+                $info_data=esi('/characters/names/', ['post'=>json_encode($search_data['character']), 'headers'=>['Content-Type: application/json']]);
+                if($info_data) foreach($info_data as $c) $char_map[strtolower($c['name'])]=$c['character_id'];
+            }
+        }
+
+        // Step 3: For still unresolved names, try non-strict (fuzzy) ESI search as a last resort.
+        $remaining=[];
+        foreach($names as $n) if(!isset($char_map[strtolower($n)])) $remaining[]=$n;
+
+        if($remaining){
+            $search_data=esi('/search/', ['path'=>'?categories=character&search='.urlencode(implode(',', $remaining)).'&strict=false']);
+            if(!empty($search_data['character'])) {
+                // ESI search returns IDs, call ESI names endpoint to match IDs back to names.
+                $info_data=esi('/characters/names/', ['post'=>json_encode($search_data['character']), 'headers'=>['Content-Type: application/json']]);
+                if($info_data) foreach($info_data as $c) $char_map[strtolower($c['name'])]=$c['character_id'];
+            }
+        }
+        
+        // Final assembly of the resolved list, including null IDs for names that could not be found.
+        foreach($names as $n){
+            $resolved[]= [
+                'name'=>$n,
+                'id'=>$char_map[strtolower($n)]??null
+            ];
+        }
+
+        echo json_encode($resolved);
+        break;
+
+      case 'pilot':
+        // Endpoint for fetching and caching core character details (corporation, alliance, birthday) from ESI.
+        $id=$post_data['id']??0;
+        if(!$id) throw new Exception('Invalid character ID');
+        
+        $db=db();
+        // Check cache for pilot details. Data is considered valid if updated within the last 30 days.
+        $stmt=$db->prepare("SELECT * FROM characters WHERE id=? AND updated_at > datetime('now', '-30 day')");
+        $stmt->execute([$id]);
+        $data=$stmt->fetch(PDO::FETCH_ASSOC);
+
+        if(!$data){
+            // Fetch fresh data from ESI
+            $char_info=esi('/characters/'.$id.'/');
+            if(empty($char_info['name'])) throw new Exception('Character not found: '.$id);
+            
+            $corp_info=esi('/corporations/'.$char_info['corporation_id'].'/');
+            $alliance_info=null;
+            if(!empty($char_info['alliance_id'])) $alliance_info=esi('/alliances/'.$char_info['alliance_id'].'/');
+
+            $data=[
+                'id'=>$id,
+                'name'=>$char_info['name'],
+                'birthday'=>$char_info['birthday'],
+                'corp_id'=>$char_info['corporation_id'],
+                'corp_name'=>$corp_info['name'],
+                'alliance_id'=>$char_info['alliance_id']??null,
+                'alliance_name'=>$alliance_info['name']??null,
+            ];
+
+            // Save/Update the character and related corporation/alliance info in the cache.
+            $stmt=$db->prepare("REPLACE INTO characters (id, name, birthday, corp_id, corp_name, alliance_id, alliance_name, updated_at) 
+                                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))");
+            $stmt->execute([
+                $data['id'], $data['name'], $data['birthday'], 
+                $data['corp_id'], $data['corp_name'], 
+                $data['alliance_id'], $data['alliance_name'], 
+            ]);
+        }
+
+        echo json_encode($data);
+        break;
+      
+      case 'stats':
+        // Endpoint for fetching and caching character combat statistics from zKillboard.
+        $id=$post_data['id']??0;
+        if(!$id) throw new Exception('Invalid character ID for stats');
+        
+        $db=db();
+        // Combat stats are volatile and cached for only 7 days.
+        $stmt=$db->prepare("SELECT * FROM stats WHERE char_id=? AND updated_at > datetime('now', '-7 day')");
+        $stmt->execute([$id]);
+        $data=$stmt->fetch(PDO::FETCH_ASSOC);
+
+        if(!$data){
+            // Fetch fresh stats from zKillboard API
+            $zkb_url='https://zkillboard.com/api/stats/characterID/'.$id.'/';
+            $zkb_data=http($zkb_url);
+            $stats=json_decode($zkb_data, true);
+
+            if(!$stats || isset($stats['error'])) throw new Exception('zKillboard Error: '.($stats['error']??'Unknown'));
+
+            $db_data=[
+                'char_id'=>$id,
+                'kills'=>$stats['kills']??0,
+                'losses'=>$stats['losses']??0,
+                'solo'=>$stats['soloKills']??0,
+                'group_kills'=>$stats['groupKills']??0,
+                'danger'=>$stats['dangerRatio']??0,
+            ];
+
+            // Persist key metrics to the stats cache
+            $stmt=$db->prepare("REPLACE INTO stats (char_id, kills, losses, solo, group_kills, danger, updated_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))");
+            $stmt->execute(array_values($db_data));
+            
+            // Attach raw statistics data from zKillboard to the response for front-end analysis (charts, timezone detection).
+            $db_data['raw_zkb_stats']=$stats;
+            $data=$db_data;
+        } else {
+            // If cached, still fetch raw ZKB data for charts/TZ detection in the frontend, as this API call is quick and ensures freshness for dynamic elements.
+            $zkb_url='https://zkillboard.com/api/stats/characterID/'.$id.'/';
+            $zkb_data=http($zkb_url);
+            $stats=json_decode($zkb_data, true);
+            $data['raw_zkb_stats']=$stats;
+        }
+
+        echo json_encode($data);
+        break;
+
+      case 'top':
+        // Endpoint for fetching and caching Top All Time lists (Ships, Systems, Alliances).
+        $id=$post_data['id']??0;
+        if(!$id) throw new Exception('Invalid character ID for TOP lists');
+        
+        $db=db();
+        // Check the 'top' table cache. Top lists are relatively static and cached for 30 days.
+        $stmt=$db->prepare("SELECT ships_json, systems_json, alliances_json FROM top WHERE char_id=? AND updated_at > datetime('now', '-30 day')");
+        $stmt->execute([$id]);
+        $data=$stmt->fetch(PDO::FETCH_ASSOC);
+
+        if(!$data || empty($data['ships_json']) || empty($data['systems_json']) || empty($data['alliances_json'])){
+            // Fetch fresh Top All Time data from zKillboard API
+            $ships_url='https://zkillboard.com/api/topalltime/characterID/'.$id.'/limit/10/type/ship/';
+            $systems_url='https://zkillboard.com/api/topalltime/characterID/'.$id.'/limit/10/type/system/';
+            $alliances_url='https://zkillboard.com/api/topalltime/characterID/'.$id.'/limit/10/type/alliance/';
+            
+            $ships_data=json_decode(http($ships_url), true);
+            $systems_data=json_decode(http($systems_url), true);
+            $alliances_data=json_decode(http($alliances_url), true);
+
+            $data=[
+                'ships_json'=>json_encode($ships_data),
+                'systems_json'=>json_encode($systems_data),
+                'alliances_json'=>json_encode($alliances_data),
+            ];
+
+            // Persist data to the top cache
+            $stmt=$db->prepare("REPLACE INTO top (char_id, ships_json, systems_json, alliances_json, updated_at) 
+                                VALUES (?, ?, ?, ?, datetime('now'))");
+            $stmt->execute([$id, $data['ships_json'], $data['systems_json'], $data['alliances_json']]);
+        }
+
+        // Decode JSON objects for the final response payload
+        echo json_encode([
+            'ships'=>json_decode($data['ships_json'], true),
+            'systems'=>json_decode($data['systems_json'], true),
+            'alliances'=>json_decode($data['alliances_json'], true),
+        ]);
+        break;
+
+      case 'zkbByUrl':
+        // Proxy endpoint for direct zKillboard API access where custom headers are needed.
+        $url=$_GET['url']??'';
+        if(!$url) throw new Exception('Missing URL parameter');
+
+        // Required headers to ensure proper access to specific zKillboard API endpoints (e.g., killmail detail or lists).
+        $opts=['headers'=>[
+            'Referer: https://zkillboard.com/', 
+            'X-Requested-With: XMLHttpRequest'
+        ]];
+        
+        $data=http($url, $opts);
+        echo $data;
+        break;
+
+      case 'zkbSalt':
+        // Proxy endpoint used to retrieve zKillboard's dynamic 'salt' parameter for specific API requests.
+        $url=$_GET['url']??'';
+        if(!$url) throw new Exception('Missing URL parameter');
+
+        // Retrieve the dynamic 'salt' parameter from zKillboard's JavaScript file.
+        $salt=http('https://zkillboard.com/js/salt.js');
+        $salt=str_replace(['document.write("', '");'], '', trim($salt));
+
+        $data=http($url.$salt);
+        echo $data;
+        break;
+
+      case 'graph':
+        // Endpoint for fetching recent killmails to generate the Interaction Matrix (Heat Map).
+        $id=$post_data['id']??0;
+        if(!$id) throw new Exception('Invalid character ID for graph');
+
+        // The graph relies on the latest 100 killmails/losses for real-time interaction assessment, so no database caching is applied here.
+        $zkb_url='https://zkillboard.com/api/kills/characterID/'.$id.'/page/1/';
+        $data=http($zkb_url);
+        echo $data;
+        break;
+
+      case 'logo':
+        // Endpoint for fetching and serving corporation/alliance logos, utilizing a local 30-day cache.
+        $id=$_GET['id']??0;
+        $type=$_GET['type']??'';
+        $size=$_GET['size']??64;
+
+        if($type!='corp' && $type!='alli') throw new Exception('Invalid type for logo');
+        if(!$id) throw new Exception('Invalid ID for logo');
+
+        $db=db();
+        // Check local logo cache
+        $stmt=$db->prepare("SELECT img_data FROM logos WHERE id=? AND type=? AND updated_at > datetime('now', '-30 day')");
+        $stmt->execute([$id, $type]);
+        $img_data=$stmt->fetchColumn();
+
+        if(!$img_data){
+            // Fetch fresh logo from ESI
+            $path=($type=='corp'?'/corporations/':'/alliances/').$id.'/logo/';
+            try {
+                $img_data=http('https://images.evetech.net/'.$path.'?size='.$size, ['timeout'=>5]);
+            } catch(Exception $e){
+                // Fallback mechanism: if the ESI imageserver is down, return the most recent logo from the local cache instead of failing.
+                $stmt=$db->prepare("SELECT img_data FROM logos WHERE id=? AND type=?");
+                $stmt->execute([$id, $type]);
+                $img_data=$stmt->fetchColumn();
+                if(!$img_data) throw new Exception('ESI/DB Error: Failed to fetch/save logo');
+            }
+            
+            // Persist the newly fetched logo (binary BLOB data) to the cache.
+            if($img_data){
+                $stmt=$db->prepare("REPLACE INTO logos (id, type, img_data, updated_at) VALUES (?, ?, ?, datetime('now'))");
+                $stmt->execute([$id, $type, $img_data]);
+            }
+        }
+        
+        // Set image headers and 1-hour public cache for the browser.
+        header('Content-Type: image/png');
+        header('Cache-Control: public, max-age=3600'); 
+        echo $img_data;
+        exit;
+
+      default:
+        throw new Exception('Invalid action');
+    }
+
+  } else {
+    // ------------------------------------------------------------------
+    // FRONTEND HTML (Standard application entry point)
+    // ------------------------------------------------------------------
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>evecia - Pilot Analysis</title>
+  <style>
+    body{ font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; background-color:#f7f7fb; color:#111; margin:0; padding:0; }
+    main{ padding:20px; }
+    .container{ max-width:1200px; margin:0 auto; display:flex; gap:20px; }
+    .main-content{ flex:1; min-width:600px; }
+    .sidebar{ width:350px; background:#fff; padding:15px; border-radius:.5rem; box-shadow:0 4px 12px rgba(0,0,0,.1); height:fit-content; }
+    h1{ font-size:1.8em; color:#333; margin-top:0; border-bottom:1px solid #eee; padding-bottom:5px; }
+    .input-group{ margin-bottom:15px; }
+    textarea{ width:100%; height:150px; padding:10px; border:1px solid #ddd; border-radius:.5rem; box-sizing:border-box; font-family:monospace; font-size:.9em; }
+    button{ padding:10px 15px; border:none; border-radius:.5rem; cursor:pointer; font-weight:bold; }
+    #go{ background-color:#007bff; color:#fff; }
+    #go:disabled{ background-color:#ccc; cursor:not-allowed; }
+    .button-group{ display:flex; gap:10px; margin-top:10px; }
+    .button-group button{ flex:1; background-color:#f0f0f0; color:#333; }
+    .button-group button:hover{ background-color:#e0e0e0; }
+    #status{ margin-top:15px; font-weight:bold; color:#555; }
+    .main-table{ width:100%; border-collapse:collapse; margin-top:20px; background:#fff; border-radius:.5rem; overflow:hidden; box-shadow:0 4px 12px rgba(0,0,0,.05); }
+    .main-table th, .main-table td{ padding:10px; border-bottom:1px solid #eee; text-align:left; }
+    .main-table th{ background-color:#f5f5f5; cursor:pointer; }
+    .main-table th.sort-asc:after{ content:"▲"; margin-left:5px; }
+    .main-table th.sort-desc:after{ content:"▼"; margin-left:5px; }
+    .main-table tr:hover{ background-color:#fafafa; }
+    .main-table img{ vertical-align:middle; border-radius:3px; margin-right:5px; }
+    .matrix-container{ margin-top:20px; padding:15px; background:#fff; border-radius:.5rem; box-shadow:0 4px 12px rgba(0,0,0,.05); }
+    .matrix-table{ width:100%; border-collapse:collapse; table-layout:fixed; }
+    .matrix-table th, .matrix-table td{ padding:5px; border:1px solid #eee; text-align:center; font-size:.8em; overflow:hidden; }
+    .matrix-table th{ background-color:#f5f5f5; font-weight:normal; }
+    .matrix-table th:first-child{ width:15%; }
+    .matrix-cell{ width:100%; height:100%; display:block; }
+    #top-panel-wrap{ margin-top:20px; }
+    #top-panel-content{ background:#fff; padding:15px; border:1px solid #ddd; border-radius:.5rem; margin-top:10px; }
+    #top-panel-content ul{ list-style:none; padding:0; margin:0; }
+    #top-panel-content li{ padding:5px 0; border-bottom:1px solid #eee; }
+    #top-panel-content li:last-child{ border-bottom:none; }
+    .help-row{ text-align:right; margin-top:20px; }
+    .help-link{ color:#007bff; text-decoration:none; font-weight:bold; }
+  </style>
+</head>
+<body>
+<main>
+  <div class="container">
+    <div class="main-content">
+      <h1>evecia Analysis</h1>
+
+      <div class="input-group">
+        <textarea id="memo" placeholder="Enter a list of characters from Local chat (or paste Ctrl+V)"></textarea>
+        <div class="button-group">
+          <button id="go">Analyze</button>
+          <button id="save">Save As (Ctrl+S)</button>
+          <button id="qsave">Quick Save (Ctrl+Q)</button>
+          <button id="open">Open (Ctrl+O)</button>
+        </div>
+        <div id="status">Loading...</div>
+      </div>
+      
+      <div id="tabs">
+        <button onclick="showTab('tab')">Statistics Table</button>
+        <button onclick="showTab('heat')">Interaction Matrix</button>
+        <button onclick="showTab('top')">Top All Time</button>
+      </div>
+
+      <div id="tab-content">
+        <div id="tab" class="tab-pane">
+          <table class="main-table" id="table">
+            <thead>
+              <tr id="table-header"></tr>
+            </thead>
+            <tbody id="table-body">
+              <tr><td colspan="10" style="text-align:center;padding:50px;color:#999">Empty Table</td></tr>
+            </tbody>
+          </table>
+        </div>
+        
+        <div id="heat" class="tab-pane" style="display:none;">
+          <div class="matrix-container">
+            <h3 style="margin-top:0;border-bottom:none;">Interaction Matrix</h3>
+            <table class="matrix-table" id="matrix">
+              <tbody id="matrix-body">
+                <tr><td colspan="2" style="text-align:center;padding:50px;color:#999">Empty Table</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div id="top" class="tab-pane" style="display:none;">
+           <h3 style="margin-top:0;border-bottom:none;">Top All Time</h3>
+           <div id="top-panel-content">
+              <p style="color:#999;text-align:center;padding:20px;">Hover over a row in the Statistics Table</p>
+           </div>
+        </div>
+      </div>
+      
+    </div>
+    <div class="sidebar">
+      <details style="margin-top:8px"><summary>Debug Console</summary><pre id="dbg" style="white-space:pre-wrap;background:#fff;border:1px solid #eee;border-radius:.5rem;padding:8px;max-height:220px;overflow:auto"></pre></details><p style="color: green;">This site does not use cookies</p>
+      
+      <div class="help-row">
+          <a href="https://evecia.online/help/" class="help-link">HELP</a>
+          <div class="arrow-container"></div>
+      </div>
+      
+    </div>
+  </div>
+</main>
+<script>(function(){
+  // Dynamic loading of app.js file
+  var boot=document.getElementById('boot');
+  var dbg=document.getElementById('dbg');
+  function mark(t,c){ if(boot){ boot.textContent=t; if(c) boot.style.color=c; } }
+  function log(x){ if(dbg){ dbg.textContent=(dbg.textContent?dbg.textContent+'\n':'')+x; } }
+  
+  mark('Loading JS…','#555');
+  window.onerror=function(msg,src,line,col,err){
+    mark('JS error: '+String(msg).slice(0,140),'#c00');
+    log((err&&err.stack)||[String(msg),src,line,col].join(' '));
+  };
+  
+  var s=document.createElement('script');
+  s.src=(window.APP_JS_PATH||'app.js')+'?v=39.3'; // Versioning for cache-busting
+  document.head.appendChild(s);
+})();</script>
+</body>
+</html>
+<?php
+  }
+} catch(Exception $e){
+  // Catch and format API exceptions as JSON errors.
+  if($action){
+    http_response_code(400);
+    echo json_encode(['error'=>$e->getMessage()]);
+  } else {
+    // Catch exceptions during the initial HTML rendering phase (rare).
+    echo '<html><body><h1>Error</h1><p>'.$e->getMessage().'</p></body></html>';
+  }
+}
+?>
